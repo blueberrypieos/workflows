@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 The Blueberry Pie OS Authors
+"""usage: pie-trace --chroot ROOT DSC OUT [-j N] [-d] [--name NAME] [--leave-out FILE] [--full]
+                 [--arch ARCH] [--build b|B|A] [--slot S] [--unshare] [--keep FILE] [--map FROM=TO]... [--scope PREFIX]...
+       pie-trace --analyse OUT [--leave-out FILE] [--keep FILE] [--map FROM=TO]... [--scope PREFIX]...
+
+Extracts DSC in ROOT, resets the access times of its files, and builds its
+binary packages under strace (run from the host). Then it sorts every file
+of the orig tarball(s) into:
+  read       opened for reading by the build. Reads of copies made by
+             whole-tree copy steps (tar, cp -a) count for the file copied.
+  stat       only checked for existence
+  untouched  never seen
+OUT gets trace.log, build.log, debs/, files.tsv, outside.txt, kept.txt,
+files-included.txt and report.txt. --analyse redoes the sorting.
+--unshare (or PIE_UNSHARE=1) runs the build in a user namespace, without sudo,
+for a chroot that belongs to the user.
+--arch is the architecture to build for (darwin-arm64; host builds for the
+machine itself).
+--leave-out names files (DEP-5 patterns, one per line, # comments) that the
+source package must not keep even though the build reads them. --full marks
+DSC as the full upstream tree: the build gets PIE_FULL_SOURCE=1, so that
+rules.mk's pie-source-guard lets it through.
+--keep names files (DEP-5 patterns, one per line, # comments) the source
+package must keep although the build only checks that they exist, where the
+trace cannot tell them from files a tool merely looks at (OpenSSL's
+Configure checks the sources of every target, built or not).
+--map declares a copy the build makes of part of the tree: FROM and TO are
+paths in the build (under the extracted source, or absolute in the chroot);
+a read of TO/X counts as a read of FROM/X, and copy tools' reads of FROM do
+not count. Maps chain. Without a map, a copy tool that reads a file of the
+tree and writes a file of the same name makes a copy of it, which counts the
+same way. Once the build replaces a file (writes it from the
+start, creates it anew, or renames another file onto it), later reads of it
+are reads of the build's own file, and a check that it exists made before
+then does not count either. The copy that a map declares is not a
+replacement: a copy tool writing TO/X, unless that tool read a file of the
+same name from outside the mapped sources (libtoolize's cp of its own
+ltmain.sh). --scope limits the sorting to the members under the
+given prefixes; every other member is kept. What pietoolchain's
+pie-source-guard reads does not count: it runs only when the source package
+is not the full one. A 3.0 (native) package's one
+tarball is its whole source.
+"""
+import argparse
+import collections
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+COPY_TOOLS = {"cp", "tar", "rsync", "cpio", "pax", "bsdtar", "find", "ditto"}
+# Build tools that require a file to exist without reading it (CMake checks
+# the sources a target lists, even ones it does not build on this host;
+# automake requires AUTHORS, NEWS and the other GNU files; make needs the
+# prerequisites of a rule even when its recipe does not read them; a
+# configure script requires install-sh and the other auxiliary files).
+NEEDS_EXISTING = {"cmake", "automake", "autoreconf", "make", "configure"}
+# Autoconf's auxiliary files, which a configure script (run by a shell)
+# requires to exist.
+AUTOCONF_AUX = {"install-sh", "missing", "compile", "depcomp", "config.guess", "config.sub", "ltmain.sh",
+                "ar-lib", "test-driver", "mkinstalldirs"}
+SHELLS = {"sh", "bash", "dash"}
+INTERPRETERS = {"sh", "bash", "dash", "perl", "python3", "python"}
+# Tools that replace autotools files with their own copies. They (and the
+# commands they run) read a file's version or timestamp before replacing it.
+UPDATERS = {"dh_update_autot", "dh_autoreconf", "autoreconf", "libtoolize", "aclocal", "autoconf", "autom4te",
+            "automake", "autopoint", "gettextize"}
+LICENCE = re.compile(r"^(LICEN[CS]E|COPYING|COPYRIGHT|NOTICE|APPLE_LICENSE|APSL)([._-].*)?$", re.I)
+
+
+def die(msg):
+    sys.exit("pie-trace: " + msg)
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, check=True, **kw)
+
+
+UNSHARE = bool(os.environ.get("PIE_UNSHARE"))
+# The environment sudo gives a build (Ubuntu's env_reset and secure_path), so
+# that builds in a user namespace see the same: an Xcode run script, for
+# one, runs chown "$USER".
+SUDO_ENV = ["HOME=/root", "LANG=C.UTF-8", "LOGNAME=root", "SHELL=/bin/bash", "TERM=unknown", "USER=root",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"]
+
+
+def id_map():
+    """unshare's options: with newuidmap (package uidmap), the other users map
+    to our subordinate ids, so that tar can give extracted files their owners."""
+    return (["--map-auto"] if shutil.which("newuidmap") else []) + ["--map-root-user"]
+
+
+def sudo(*cmd, **kw):
+    """Run CMD as root; in unshare mode, as root of a user namespace with the
+    same id map as the builds, so that it can remove what they made."""
+    return sh((["unshare"] + id_map() if UNSHARE else ["sudo", "-n"]) + list(cmd), **kw)
+
+
+def in_root(root, script, wrap=(), bind=None):
+    """The command that runs SCRIPT in the chroot ROOT, under the command
+    WRAP (strace) if given. In unshare mode it is a user namespace where we
+    are root, with /dev and /proc mounted. WRAP runs inside the namespace,
+    after newuidmap (setuid, which a traced process cannot use), with the
+    namespace's own /proc. BIND=(HOSTDIR, INSIDE) mounts HOSTDIR at INSIDE
+    in the chroot, in a mount namespace of the command's own."""
+    if not UNSHARE:
+        if not bind:
+            return ["sudo", "-n"] + list(wrap) + ["chroot", root, "/bin/sh", "-c", script]
+        return ["sudo", "-n", "unshare", "--mount", "/bin/sh", "-c",
+                'r=$1 h=$2 i=$3; shift 3; mkdir -p "$r$i" && mount --bind "$h" "$r$i" && exec "$@"',
+                "sh", root, bind[0], bind[1]] + list(wrap) + ["chroot", root, "/bin/sh", "-c", script]
+    proc = "mount -t proc proc /proc && " if wrap else ""
+    mnt = 'mkdir -p "$0$3" && mount --bind "$2" "$0$3" && ' if bind else ""
+    return ["unshare"] + id_map() + ["--mount", "--pid", "--fork", "/bin/sh", "-c",
+            proc + mnt + 'mount --rbind /dev "$0/dev" && mount -t proc proc "$0/proc" && exec %s chroot "$0" /bin/sh -c "$1"'
+            % shlex.join(["env", "-i"] + SUDO_ENV + list(wrap)), root, script] + (list(bind) if bind else [])
+
+
+def dsc_fields(dsc):
+    text = open(dsc).read()
+    src = re.search(r"^Source: (\S+)", text, re.M).group(1)
+    version = re.search(r"^Version: (\S+)", text, re.M).group(1)
+    files = [l.split()[2] for l in re.search(r"^Files:\n((?: .*\n?)+)", text, re.M).group(1).splitlines() if l.strip()]
+    return src, version, files
+
+
+def orig_members(dscdir, files):
+    """{tree path: tar type char} for the orig tarball and its components."""
+    members = {}
+    for f in files:
+        m = re.match(r".*\.orig(?:-([A-Za-z0-9][-A-Za-z0-9]*))?\.tar\.\w+$", f)
+        native = not m and re.match(r".*\.tar\.\w+$", f) and not re.match(r".*\.debian\.tar\.\w+$", f)
+        if not m and not native:
+            continue
+        comp = m.group(1) if m else None
+        out = subprocess.run(["tar", "--list", "--verbose", "--numeric-owner", "--quoting-style=literal", "-f",
+                              os.path.join(dscdir, f)], check=True, capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            parts = line.split(None, 5)
+            kind, name = parts[0][0], parts[5]
+            if kind in "lh":
+                name = name.split(" -> " if kind == "l" else " link to ", 1)[0]
+            name = name.split("/", 1)[1] if "/" in name else ""
+            # dpkg-source replaces an orig tarball's debian/ with the package's.
+            if not name or kind == "d" or name == "debian" or name.startswith("debian/"):
+                continue
+            members[(comp + "/" if comp else "") + name] = kind
+    return members
+
+
+def run_trace(root, dsc, out, jobs, nodeps, name, full=False, arch="darwin-arm64", build_type="b", slot=None):
+    src, version, files = dsc_fields(dsc)
+    name = name or src
+    inside = "/work/trace-" + name
+    # With a slot, the build has a directory of its own on the host, mounted
+    # at INSIDE for it alone: builds in other slots run at the same time, at
+    # the same path.
+    w = root + inside + ("." + slot if slot else "")
+    bind = (w, inside) if slot else None
+    sudo("rm", "-rf", w)
+    sudo("mkdir", "-p", w)
+    here = os.path.dirname(os.path.abspath(dsc))
+    sudo("cp", os.path.abspath(dsc), *[os.path.join(here, f) for f in files], w + "/")
+    sh(in_root(root, "cd %s && dpkg-source -q -x %s src >/dev/null" % (inside, os.path.basename(dsc)), bind=bind))
+    sudo("find", w + "/src", "-xdev", "-exec", "touch", "-a", "-h", "-d", "@0", "{}", "+")
+    if os.path.exists(out):
+        shutil.rmtree(out)
+    os.makedirs(os.path.join(out, "debs"))
+    build = "cd %s/src && %sdpkg-buildpackage %s-%s -us -uc -j%d%s > ../build.log 2>&1" % (
+        inside, "PIE_FULL_SOURCE=1 " if full else "", "" if arch == "host" else "-a %s " % arch, build_type, jobs,
+        " -d" if nodeps else "")
+    strace = ["strace", "-f", "-qq", "-y", "-Y", "--seccomp-bpf", "-s", "4096",
+              "-e", "trace=open,openat,openat2,creat,stat,lstat,newfstatat,statx,access,faccessat,"
+                    "faccessat2,readlink,readlinkat,execve,execveat,rename,renameat,renameat2,"
+                    "chdir,fchdir,clone,clone3,fork,vfork",
+              "-e", "status=successful", "-o", os.path.abspath(os.path.join(out, "trace.log")), "--"]
+    rc = subprocess.run(in_root(root, build, strace, bind)).returncode
+    sudo("cp", w + "/build.log", out + "/")
+    if not UNSHARE:
+        sudo("chown", "-R", "%d:%d" % (os.getuid(), os.getgid()), out)
+    for f in os.listdir(w):
+        if f.endswith(".deb"):
+            shutil.copy(os.path.join(w, f), os.path.join(out, "debs"))
+    atimes = {}
+    members = orig_members(here, files)
+    for path in members:
+        try:
+            atimes[path] = os.lstat(os.path.join(w, "src", path)).st_atime > 0
+        except FileNotFoundError:
+            atimes[path] = None
+    json.dump({"root": root, "inside": inside, "dsc": os.path.abspath(dsc), "src": src, "version": version,
+               "rc": rc, "members": members, "atimes": atimes}, open(os.path.join(out, "meta.json"), "w"))
+    if rc != 0:
+        die("the build failed (rc %d); see %s/build.log" % (rc, out))
+
+
+LINE = re.compile(r"^(\d+)<(.*?)> (\w+)\((.*)\) += (-?\d+)(?:<(.*)>)?(?: \(.*\))?$")
+
+
+def events(log):
+    """Joins strace's unfinished/resumed halves and yields parsed calls."""
+    pending = {}
+    for line in open(log, errors="replace"):
+        line = line.rstrip("\n")
+        m = re.match(r"^(\d+)<.*?> .* <unfinished \.\.\.>$", line)
+        if m:
+            pending[m.group(1)] = line[:-len(" <unfinished ...>")]
+            continue
+        m = re.match(r"^(\d+)<(.*?)> <\.\.\. \w+ resumed>(.*)$", line)
+        if m:
+            line = pending.pop(m.group(1), "") + m.group(3)
+        m = LINE.match(line)
+        if m:
+            yield m.groups()
+
+
+def dep5(pattern):
+    return re.compile("".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern) + r"\Z", re.S)
+
+
+def analyse(out, leave_out=None, maps=(), scope=(), keep=None):
+    meta = json.load(open(os.path.join(out, "meta.json")))
+    root, tree = meta["root"].rstrip("/"), meta["inside"] + "/src"
+    members = meta["members"]
+    copies = []
+    for m in maps:
+        a, b = m.split("=", 1)
+        a = a if a.startswith("/") else tree + "/" + a
+        b = b if b.startswith("/") else tree + "/" + b
+        copies.append((os.path.normpath(a), os.path.normpath(b)))
+
+    def chroot_path(p):
+        p = os.path.normpath(p)
+        return p[len(root):] or "/" if p == root or p.startswith(root + "/") else p
+
+    cwd = {}  # pid -> working directory in the chroot
+
+    def resolve(args, pid=None, nth=0):
+        """The nth path argument of a call, as a path in the chroot."""
+        found = list(re.finditer(r'(?:(?:(\w+)<([^>]*)>|(-?\d+|AT_FDCWD)), )?"((?:[^"\\]|\\.)*)"', args))
+        if len(found) <= nth:
+            return None
+        m = found[nth]
+        base, name = m.group(2), m.group(4)
+        if name.startswith("/"):
+            return os.path.normpath(name)
+        if base:
+            return chroot_path(os.path.join(base, name))
+        if m.group(3) is None and pid in cwd:
+            return os.path.normpath(os.path.join(cwd[pid], name))
+        return None
+
+    reads = collections.defaultdict(set)      # chroot path -> comms that read it
+    stats = collections.defaultdict(set)      # chroot path -> (comm, path the build used)
+    writes = collections.defaultdict(set)     # pid -> written paths
+    pid_reads = collections.defaultdict(set)  # pid -> tree files read
+    pid_comm = {}
+    sources = [a for a, b in copies]
+    targets = [b for a, b in copies]
+    replaced = set()       # paths the build has replaced with its own file, for now
+    ever_replaced = set()  # paths the build replaced at some time
+    outside_names = collections.defaultdict(set)  # copy tool pid -> names it read outside the sources
+    exe = {}         # pid -> name of the program it runs (strace's names lag behind execve)
+    parent = {}      # pid -> parent pid
+    checks = []      # reads by an updater: (source, pid, comm, path the build used)
+    guard = set()    # pietoolchain's pie-source-guard and what it runs: not part of the build
+    copied = collections.defaultdict(dict)  # copy tool pid -> file name -> source it read
+    filecopy = {}    # a copy tool's output -> the source it copied
+
+    def script(path, args):
+        """What an execve runs: the script, for an interpreter running one."""
+        argv = re.findall(r'"((?:[^"\\]|\\.)*)"', args)[1:]
+        if os.path.basename(path) in INTERPRETERS and len(argv) > 1 and not argv[1].startswith("-"):
+            return argv[1]
+        return path
+
+    def program(path, args):
+        return os.path.basename(script(path, args))[:15]
+
+    def updater(pid):
+        for _ in range(3):
+            if exe.get(pid) in UPDATERS:
+                return True
+            pid = parent.get(pid)
+        return False
+
+    def in_tree(path):
+        return path.startswith(tree + "/")
+
+    def mapped(path):
+        """The source path a read stands for, or None after a replacement."""
+        for _ in range(8):
+            if path in replaced:
+                return None
+            if path in filecopy:
+                path = filecopy[path]
+                continue
+            for a, b in copies:
+                if path.startswith(b + "/"):
+                    path = a + path[len(b):]
+                    break
+            else:
+                break
+        return None if path in replaced else path
+
+    def written(pid, comm, path):
+        # Only orig files and the mapped copies of them can be replaced; the
+        # build's own files (an install tree it copies into) cannot.
+        copy = any(path.startswith(b + "/") for b in targets) or path in filecopy
+        if not in_tree(path) or not (copy or path[len(tree) + 1:] in members):
+            return
+        if comm in COPY_TOOLS and copy and os.path.basename(path) not in outside_names[pid]:
+            replaced.discard(path)
+            return
+        replaced.add(path)
+        ever_replaced.add(path)
+
+    for pid, comm, call, args, ret, decoded in events(os.path.join(out, "trace.log")):
+        comm = exe.get(pid, comm)
+        pid_comm[pid] = comm
+        at = re.search(r"AT_FDCWD<([^>]*)>", args)
+        if at:
+            cwd[pid] = chroot_path(at.group(1))
+        if pid in guard:
+            if call in ("clone", "clone3", "fork", "vfork") and ret.isdigit():
+                guard.add(ret)
+            continue
+        if call in ("execve", "execveat") and resolve(args, pid) and \
+                os.path.basename(script(resolve(args, pid), args)) == "pie-source-guard":
+            guard.add(pid)
+            source = mapped(resolve(args, pid))
+            if source:
+                reads[source].add((pid, comm))
+            continue
+        if call in ("clone", "clone3", "fork", "vfork"):
+            if ret.isdigit():
+                parent[ret] = pid
+                exe.setdefault(ret, comm)
+                if pid in cwd:
+                    cwd.setdefault(ret, cwd[pid])
+            continue
+        if call == "chdir":
+            path = resolve(args, pid)
+            if path:
+                cwd[pid] = path
+            continue
+        if call == "fchdir":
+            m = re.match(r"\d+<([^>]*)>", args)
+            if m:
+                cwd[pid] = chroot_path(m.group(1))
+            continue
+        if call in ("rename", "renameat", "renameat2"):
+            path = resolve(args, pid, 1)
+            if path:
+                writes[pid].add(path)
+                written(pid, comm, path)
+            continue
+        if call in ("open", "openat", "openat2", "creat"):
+            if not decoded:
+                continue
+            path = chroot_path(decoded)
+            if call != "creat" and ("O_RDONLY" in args or "O_RDWR" in args) and "O_DIRECTORY" not in args:
+                if comm in COPY_TOOLS:
+                    # What a copy tool reads: a tree file it copies, or a
+                    # file from elsewhere that replaces one.
+                    source = mapped(path)
+                    if source and in_tree(source) and source[len(tree) + 1:] in members:
+                        copied[pid][os.path.basename(path)] = source
+                    elif not any(path.startswith(b + "/") for b in targets):
+                        outside_names[pid].add(os.path.basename(path))
+                if comm in COPY_TOOLS and any(path.startswith(a + "/") for a in sources):
+                    continue
+                source = mapped(path)
+                if source:
+                    reads[source].add((pid, comm))
+                    if updater(pid):
+                        checks.append((source, pid, comm, path))
+            if call == "creat" or "O_WRONLY" in args or "O_RDWR" in args:
+                writes[pid].add(path)
+                # A copy tool writing a file of the name it just read: a copy.
+                name = os.path.basename(path)
+                if comm in COPY_TOOLS and name in copied[pid] and in_tree(path) and path[len(tree) + 1:] not in members:
+                    filecopy[path] = copied[pid][name]
+                if call == "creat" or "O_TRUNC" in args or ("O_CREAT" in args and "O_EXCL" in args):
+                    written(pid, comm, path)
+        elif call in ("execve", "execveat"):
+            path = resolve(args, pid)
+            if path:
+                exe[pid] = program(path, args)
+                source = mapped(path)
+                if source:
+                    reads[source].add((pid, comm))
+        else:
+            path = resolve(args, pid)
+            if path:
+                source = mapped(path)
+                if source:
+                    stats[source].add((comm, path))
+    # A check that a file exists does not count when the build later
+    # replaced the file it checked: the build makes that file itself. Nor
+    # does an updater's read of a file it (or another updater) then replaced.
+    for source, pid, comm, used in checks:
+        if used in ever_replaced or source in ever_replaced:
+            reads[source].discard((pid, comm))
+    stats = {p: {c for c, used in v if used not in ever_replaced} for p, v in stats.items()}
+    stats = {p: v for p, v in stats.items() if v}
+
+    def rel(path):
+        return path[len(tree) + 1:] if path.startswith(tree + "/") else None
+
+    # Whole-tree copies: a copy tool reading many files, and the place their
+    # copies were written to (a root under which the tree's paths recur).
+    for path, who in reads.items():
+        r = rel(path)
+        if r in members:
+            for pid, comm in who:
+                pid_reads[pid].add(r)
+    bulk = {pid for pid, rs in pid_reads.items() if pid_comm.get(pid) in COPY_TOOLS and len(rs) >= 50}
+    by_name = collections.defaultdict(list)
+    for m in members:
+        by_name[os.path.basename(m)].append(m)
+    roots = collections.Counter()
+    for pid, paths in writes.items():
+        if pid_comm.get(pid) not in COPY_TOOLS:
+            continue
+        for p in paths:
+            for m in by_name.get(os.path.basename(p), ()):
+                if p.endswith("/" + m) and not p.startswith(tree + "/" + m):
+                    roots[p[:-len(m) - 1]] += 1
+    copy_roots = sorted(r for r, n in roots.items() if n >= 50)
+
+    state = {}
+    via = collections.defaultdict(set)
+    for path, who in reads.items():
+        r = rel(path)
+        real = [(pid, c) for pid, c in who if pid not in bulk]
+        if r in members and real:
+            via[r].update(c for _, c in real)
+        for cr in copy_roots:
+            if path.startswith(cr + "/"):
+                m = path[len(cr) + 1:]
+                if m in members and real:
+                    via[m].update("copy:" + c for _, c in real)
+    for m in members:
+        state[m] = "read" if via.get(m) else "untouched"
+    stat_rel = {rel(p) for p in stats} | {rel(p) for p, who in reads.items() if all(pid in bulk for pid, _ in who)}
+    for cr in copy_roots:
+        for p in stats:
+            if p.startswith(cr + "/"):
+                stat_rel.add(p[len(cr) + 1:])
+    for m in members:
+        if state[m] == "untouched" and m in stat_rel:
+            state[m] = "stat"
+    for p, comms in stats.items():
+        r = rel(p)
+        for cr in copy_roots:
+            if p.startswith(cr + "/"):
+                r = p[len(cr) + 1:]
+        if r in members and state[r] == "stat" and comms & NEEDS_EXISTING:
+            state[r] = "read"
+            via[r].update("stat:" + c for c in comms & NEEDS_EXISTING)
+        elif r in members and state[r] == "stat" and os.path.basename(r) in AUTOCONF_AUX and comms & SHELLS:
+            state[r] = "read"
+            via[r].add("stat:autoconf-aux")
+
+    # What the source package must keep.
+    kept = {m for m, s in state.items() if s == "read"}
+    if scope:
+        kept |= {m for m in members if not any(m == p or m.startswith(p.rstrip("/") + "/") for p in scope)}
+    if keep:
+        pats = [dep5(l.split("#", 1)[0].strip()) for l in open(keep) if l.split("#", 1)[0].strip()]
+        kept |= {m for m in members if any(p.match(m) for p in pats)}
+    patched = set()
+    debian = os.path.join(root + tree, "debian", "patches", "series")
+    if os.path.exists(debian):
+        for line in open(debian):
+            p = line.split("#", 1)[0].split()
+            if p:
+                text = open(os.path.join(os.path.dirname(debian), p[0]), errors="replace").read()
+                for mm in re.finditer(r"^\+\+\+ \S+?/(\S+)", text, re.M):
+                    if mm.group(1) in members:
+                        patched.add(mm.group(1))
+    kept |= patched
+    for m, kind in members.items():
+        if kind == "l":
+            target = os.path.normpath(os.path.join(os.path.dirname(m), os.readlink(root + tree + "/" + m))) \
+                if os.path.islink(root + tree + "/" + m) else None
+            if target in kept:
+                kept.add(m)
+    dirs = {os.path.dirname(k) for k in kept}
+    for m in members:
+        if LICENCE.match(os.path.basename(m)):
+            d = os.path.dirname(m)
+            if any(x == d or x.startswith(d + "/") or d == "" for x in dirs):
+                kept.add(m)
+
+    left_used = []
+    if leave_out:
+        pats = [dep5(l.split("#", 1)[0].strip()) for l in open(leave_out) if l.split("#", 1)[0].strip()]
+        for m in sorted(kept):
+            if any(p.match(m) for p in pats):
+                kept.discard(m)
+                if state[m] == "read":
+                    left_used.append(m)
+    atimes = meta["atimes"]
+    atime_only = sorted(m for m in members if atimes.get(m) and m not in kept)
+    outside = sorted(p for p, who in reads.items() if not p.startswith(tree + "/") and not p.startswith(
+        ("/proc/", "/dev/", "/sys/", "pipe:", "socket:", "anon_inode:")) and not any(p.startswith(cr + "/") for cr in copy_roots))
+
+    with open(os.path.join(out, "files.tsv"), "w") as f:
+        for m in sorted(members):
+            f.write("%s\t%s\t%s\t%s\n" % ("kept" if m in kept else "out", state[m], ",".join(sorted(via.get(m, ()))), m))
+    open(os.path.join(out, "kept.txt"), "w").write("".join(k + "\n" for k in sorted(kept)))
+    open(os.path.join(out, "outside.txt"), "w").write("".join(p + "\n" for p in outside))
+    patterns = compress(set(members), kept)
+    open(os.path.join(out, "files-included.txt"), "w").write("".join(p + "\n" for p in patterns))
+    counts = collections.Counter(state.values())
+    report = [
+        "source: %s %s (build rc %d)" % (meta["src"], meta["version"], meta["rc"]),
+        "orig files: %d; kept %d; left out %d" % (len(members), len(kept), len(members) - len(kept)),
+        "read %d, existence-checked only %d, untouched %d" % (counts["read"], counts["stat"], counts["untouched"]),
+        "patched by debian/patches: %d (%d of them never read)" % (len(patched), len(patched - {m for m in members if state[m] == 'read'})),
+        "whole-tree copy steps: %d process(es); copy roots: %s" % (len(bulk), ", ".join(copy_roots) or "none"),
+        "orig files the build replaced with its own: %d" % len(
+            {p for p in ever_replaced if rel(p) in members or any(p.startswith(b + "/") for b in targets)}),
+        "atime says read but the trace does not (kept out): %d" % len(atime_only),
+        "Files-Included patterns: %d" % len(patterns),
+        "left out although the build reads them (--leave-out): %d" % len(left_used),
+    ]
+    if atime_only:
+        report += ["  " + m for m in atime_only[:50]]
+    open(os.path.join(out, "left-out-used.txt"), "w").write("".join(m + "\n" for m in left_used))
+    open(os.path.join(out, "report.txt"), "w").write("\n".join(report) + "\n")
+    print("\n".join(report))
+
+
+def compress(members, kept):
+    """The shortest pattern list: dir/* where a whole directory is kept."""
+    children = collections.defaultdict(set)
+    for m in members:
+        parts = m.split("/")
+        for i in range(1, len(parts)):
+            children["/".join(parts[:i - 1])].add("/".join(parts[:i]))
+        children["/".join(parts[:-1])].add(m)
+    full = {}
+
+    def is_full(d):
+        if d not in full:
+            full[d] = all((c in kept) if c in members else is_full(c) for c in children[d])
+        return full[d]
+
+    out = []
+
+    def walk(d):
+        for c in sorted(children[d]):
+            if c in members:
+                if c in kept:
+                    out.append(c)
+            elif is_full(c):
+                out.append(c + "/*")
+            elif any(k.startswith(c + "/") for k in kept):
+                walk(c)
+    if is_full(""):
+        return ["*"]
+    walk("")
+    return [p.replace(" ", "?") for p in out]
+
+
+def main():
+    ap = argparse.ArgumentParser(usage=__doc__)
+    ap.add_argument("--chroot")
+    ap.add_argument("--analyse", action="store_true")
+    ap.add_argument("dsc", nargs="?")
+    ap.add_argument("out")
+    ap.add_argument("-j", dest="jobs", type=int, default=os.cpu_count())
+    ap.add_argument("-d", dest="nodeps", action="store_true")
+    ap.add_argument("--name")
+    ap.add_argument("--leave-out")
+    ap.add_argument("--full", action="store_true")
+    ap.add_argument("--arch", default="darwin-arm64")
+    ap.add_argument("--slot", help="build in a directory of its own, so that other slots can build at once")
+    ap.add_argument("--build", choices=("b", "B", "A"), default="b",
+                    help="dpkg-buildpackage's -b (all), -B (arch only) or -A (indep only)")
+    ap.add_argument("--unshare", action="store_true")
+    ap.add_argument("--keep")
+    ap.add_argument("--map", action="append", default=[])
+    ap.add_argument("--scope", action="append", default=[])
+    a = ap.parse_args()
+    out = os.path.abspath(a.out)
+    if not a.analyse:
+        if a.unshare:
+            global UNSHARE
+            UNSHARE = True
+        if not (a.chroot and a.dsc):
+            die("need --chroot ROOT DSC OUT")
+        run_trace(a.chroot, a.dsc, out, a.jobs, a.nodeps, a.name, a.full, a.arch, a.build, a.slot)
+    analyse(out, a.leave_out and os.path.abspath(a.leave_out), a.map, a.scope, a.keep and os.path.abspath(a.keep))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 The Blueberry Pie OS Authors
+"""usage: pie-components COPYRIGHT FILES-INCLUDED COMPONENT...
+
+For a source package with upstream components (gbp.conf's component list),
+rewrites the first paragraph of COPYRIGHT so that it leaves out the files
+FILES-INCLUDED does not list. FILES-INCLUDED holds paths and patterns from
+the top of the source tree, as pie-trace writes them. The paths under a
+component's directory go into Files-Excluded-COMPONENT: * and
+Files-Included-COMPONENT, relative to that directory. The others go into
+Files-Excluded: * and Files-Included.
+"""
+import re
+import sys
+
+
+def main():
+    if len(sys.argv) < 4:
+        sys.exit(__doc__)
+    copyright, included, comps = sys.argv[1], sys.argv[2], sys.argv[3:]
+    lists = {c: [] for c in [None] + comps}
+    for line in open(included):
+        p = line.strip()
+        if not p:
+            continue
+        head = p.split("/", 1)
+        if head[0] in comps:
+            if len(head) == 1:
+                sys.exit("pie-components: %s names a whole component; use %s/*" % (p, p))
+            lists[head[0]].append(head[1])
+        else:
+            lists[None].append(p)
+    text = open(copyright).read()
+    first, rest = re.split(r"\n[ \t]*\n", text, maxsplit=1)
+    first = re.sub(r"^Files-(Excluded|Included)(-[A-Za-z0-9.+-]+)?:.*\n?(?:[ \t].*\n?)*", "", first + "\n",
+                   flags=re.M).rstrip("\n")
+    fields = []
+    for comp in [None] + comps:
+        suffix = "-" + comp if comp else ""
+        if not lists[comp]:
+            sys.exit("pie-components: no file of %s is kept" % (comp or "the main tarball"))
+        fields.append("Files-Excluded%s: *" % suffix)
+        fields.append("Files-Included%s:\n%s" % (suffix, "\n".join(" " + p for p in lists[comp])))
+    lines = first.split("\n")
+    # The fields go after Upstream-Name and Source, before anything else.
+    at = 1
+    while at < len(lines) and (lines[at].startswith((" ", "\t")) or lines[at].split(":", 1)[0] in
+                               ("Upstream-Name", "Upstream-Contact", "Source")):
+        at += 1
+    first = "\n".join(lines[:at] + fields + lines[at:])
+    open(copyright, "w").write(first + "\n\n" + rest)
+
+
+if __name__ == "__main__":
+    main()

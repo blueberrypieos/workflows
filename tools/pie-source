@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 The Blueberry Pie OS Authors
+"""usage: pie-source orig [--full] [-C REPO] [-o OUT]
+       pie-source source [--full] [-C REPO] [-o OUT]
+       pie-source binary DSC [-o OUT] [--work DIR] [-j N] [-d] [--no-network]
+
+orig    Makes the upstream tarball for debian/changelog's version from the
+        upstream tag (gbp.conf's upstream-tag; X+dsN uses X's tag). It keeps
+        only the files that debian/copyright's Files-Excluded and
+        Files-Included leave in, as mk-origtargz does. Each component in
+        gbp.conf gets its own tarball from its directory of the upstream
+        tree, filtered by Files-Excluded-COMPONENT and
+        Files-Included-COMPONENT.
+source  Makes the source package from that tarball and HEAD's debian/. For
+        a 3.0 (native) package, the tree is HEAD plus each submodule at the
+        commit HEAD records, less what Files-Excluded and Files-Included
+        leave out. When gbp.conf's upstream-tree is SLOPPY, that tree
+        without debian/ is the upstream tarball.
+binary  Builds the binary packages from DSC alone, in a new directory, and
+        merges the source and binary .changes.
+--full  Keeps every upstream file. Only for the analysis build.
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def die(msg):
+    sys.exit("pie-source: " + msg)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, check=True, **kw)
+
+
+def output(cmd, **kw):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw).stdout.strip()
+
+
+def changelog(debian):
+    f = os.path.join(debian, "changelog")
+    return output(["dpkg-parsechangelog", "-l", f, "-SSource"]), output(["dpkg-parsechangelog", "-l", f, "-SVersion"])
+
+
+def upstream_version(version):
+    v = version.split(":", 1)[-1]
+    return v.rsplit("-", 1)[0] if "-" in v else v
+
+
+def header(repo):
+    """The patterns in debian/copyright's first paragraph, by field."""
+    text = open(os.path.join(repo, "debian", "copyright")).read()
+    first = re.split(r"\n[ \t]*\n", text, maxsplit=1)[0]
+    fields = {}
+    for m in re.finditer(r"^([A-Za-z][A-Za-z0-9-]*):[ \t]*(.*(?:\n[ \t]+.*)*)", first, re.M):
+        fields[m.group(1)] = m.group(2).split()
+    return fields
+
+
+def upstream_commit(repo, base):
+    fmt = output(["gbp", "config", "buildpackage.upstream-tag"], cwd=repo)
+    from gbp.deb.git import DebianGitRepository
+    tag = DebianGitRepository.version_to_tag(fmt, base)
+    return tag, output(["git", "rev-parse", "--verify", "--quiet", tag + "^{commit}"], cwd=repo)
+
+
+def components(repo):
+    """gbp.conf's upstream components: subdirectories of the upstream tree that
+    have their own orig-COMPONENT tarball."""
+    res = subprocess.run(["gbp", "config", "buildpackage.component"], cwd=repo, capture_output=True, text=True)
+    value = res.stdout.strip()
+    if res.returncode != 0 or not value or value == "[]":
+        return []
+    import ast
+    return list(ast.literal_eval(value))
+
+
+def make_orig(repo, out, full):
+    src, version = changelog(os.path.join(repo, "debian"))
+    upver = upstream_version(version)
+    base = re.sub(r"\+ds\d*$", "", upver)
+    tag, commit = upstream_commit(repo, base)
+    fields = header(repo)
+    filtered = not full and "Files-Excluded" in fields
+    if not full:
+        if upver != base and not filtered:
+            die("%s is a +ds version, but debian/copyright has no Files-Excluded" % upver)
+        if filtered and upver == base:
+            die("debian/copyright leaves files out, so the version needs a +dsN suffix")
+    os.makedirs(out, exist_ok=True)
+    comps = components(repo)
+    origs = []
+    for comp in [None] + comps:
+        name = "%s_%s.orig%s.tar.xz" % (src, upver, "-" + comp if comp else "")
+        with tempfile.TemporaryDirectory() as tmp:
+            tar = os.path.join(tmp, name[:-3])
+            if comp:
+                # A tree has no date, so git archive would stamp the current time.
+                ct = output(["git", "log", "-1", "--format=%ct", commit], cwd=repo).strip()
+                tree, prefix, paths = "%s:%s" % (commit, comp), comp, []
+                opts = ["--mtime=@" + ct]
+            else:
+                tree, prefix, paths = commit, "%s-%s" % (src, upver), ["--", "."] + [":(exclude)%s" % c for c in comps]
+                opts = []
+            with open(tar, "wb") as f:
+                run(["git", "-c", "tar.umask=0022", "-c", "core.autocrlf=false", "archive", "--format=tar",
+                     "--prefix=%s/" % prefix] + opts + [tree] + paths, cwd=repo, stdout=f)
+            stanza = "Files-Excluded-" + comp if comp else "Files-Excluded"
+            if filtered and stanza in fields:
+                res = subprocess.run(["mk-origtargz", "--package", src, "--version", upver, "--compression", "xz",
+                                      "--copyright-file", os.path.join(repo, "debian", "copyright"),
+                                      "--directory", tmp, "--copy"] + (["--component", comp] if comp else []) + [tar],
+                                     cwd=repo, capture_output=True, text=True)
+                log = res.stdout + res.stderr
+                if res.returncode != 0 or re.search(r"warn|No files matched", log, re.I):
+                    sys.stderr.write(log)
+                    die("mk-origtargz failed or warned for %s" % name)
+                made = os.path.join(tmp, name)
+            else:
+                if filtered and comp:
+                    die("debian/copyright leaves files out, but has no %s field" % stanza)
+                made = tar + ".xz"
+                with open(made, "wb") as f:
+                    run(["xz", "-6", "-T1", "-c", tar], stdout=f)
+            shutil.move(made, os.path.join(out, name))
+        origs.append((comp, os.path.join(out, name)))
+    return src, version, upver, tag, commit, origs
+
+
+def tar_names(tarball):
+    names = output(["tar", "-tf", tarball]).split("\n")
+    return {n.split("/", 1)[1] for n in names if "/" in n and not n.endswith("/")}
+
+
+def created_by_patches(tree):
+    """Files that debian/patches create, from their series."""
+    series = os.path.join(tree, "debian", "patches", "series")
+    made = []
+    if not os.path.exists(series):
+        return made
+    for line in open(series):
+        p = line.split("#", 1)[0].split()
+        if not p:
+            continue
+        text = open(os.path.join(tree, "debian", "patches", p[0]), errors="replace").read()
+        for m in re.finditer(r"^--- /dev/null[^\n]*\n\+\+\+ (\S+)", text, re.M):
+            made.append((p[0], m.group(1).split("/", 1)[1] if "/" in m.group(1) else m.group(1)))
+    return made
+
+
+def dep5_matcher(patterns):
+    """copyright-format patterns: * and ? match / too; a directory matches
+    everything under it. Plain paths and dir/* go through sets."""
+    exact, prefixes, rx = set(), [], []
+    for p in patterns:
+        p = p.rstrip("/")
+        if "*" not in p and "?" not in p:
+            exact.add(p)
+            prefixes.append(p + "/")
+        elif p.endswith("/*") and "*" not in p[:-2] and "?" not in p[:-2]:
+            prefixes.append(p[:-1])
+        else:
+            rx.append(re.compile("".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in p)
+                                 + r"(?:/.*)?\Z", re.S))
+    def match(f):
+        if f in exact or any(f.startswith(x) for x in prefixes):
+            return True
+        return any(r.match(f) for r in rx)
+    return match
+
+
+def gitlinks(repo, commit, prefix=""):
+    """(path, commit, repo dir) of every submodule HEAD records, recursively
+    for those checked out."""
+    out = []
+    for line in output(["git", "ls-tree", "-r", "-z", commit], cwd=repo).split("\0"):
+        if not line:
+            continue
+        meta, path = line.split("\t", 1)
+        mode, kind, sha = meta.split()
+        if kind != "commit":
+            continue
+        sub = os.path.join(repo, path)
+        if not os.path.exists(os.path.join(sub, ".git")):
+            sys.stderr.write("pie-source: %s%s is not checked out; left out\n" % (prefix, path))
+            continue
+        out.append((prefix + path, sha, sub))
+        out += gitlinks(sub, sha, prefix + path + "/")
+    return out
+
+
+def assemble(repo, tree, full):
+    """HEAD and each submodule at the commit HEAD records, in TREE, less what
+    Files-Excluded and Files-Included leave out."""
+    os.makedirs(tree)
+    for path, commit, where in [("", "HEAD", repo)] + gitlinks(repo, "HEAD"):
+        archive = subprocess.Popen(["git", "-c", "tar.umask=0022", "-c", "core.autocrlf=false", "archive",
+                                    "--format=tar"] + (["--prefix=%s/" % path] if path else []) + [commit],
+                                   cwd=where, stdout=subprocess.PIPE)
+        run(["tar", "-xf", "-", "-C", tree], stdin=archive.stdout)
+        if archive.wait() != 0:
+            die("git archive failed in %s" % where)
+    fields = header(repo)
+    if not full and "Files-Excluded" in fields:
+        excluded = dep5_matcher(fields["Files-Excluded"])
+        included = dep5_matcher(fields.get("Files-Included", []))
+        removed = 0
+        for d, dirs, files in os.walk(tree, topdown=False):
+            rel = os.path.relpath(d, tree)
+            if rel == "debian" or rel.startswith("debian/"):
+                continue
+            for f in files + [x for x in dirs if os.path.islink(os.path.join(d, x))]:
+                path = os.path.normpath(os.path.join(rel, f))
+                if excluded(path) and not included(path):
+                    os.unlink(os.path.join(d, f))
+                    removed += 1
+            if rel != "." and not os.listdir(d):
+                os.rmdir(d)
+        sys.stderr.write("pie-source: left out %d files\n" % removed)
+
+
+def finish(src, version, tree, work, out):
+    run(["dpkg-buildpackage", "-S", "-nc", "-d", "-us", "-uc"], cwd=tree,
+        stdout=subprocess.DEVNULL if os.environ.get("PIE_QUIET") else None)
+    for f in os.listdir(work):
+        if f.startswith(src + "_") and os.path.isfile(os.path.join(work, f)):
+            shutil.move(os.path.join(work, f), os.path.join(out, f))
+    dsc = os.path.join(out, "%s_%s.dsc" % (src, version.split(":", 1)[-1]))
+    print(dsc)
+    return dsc
+
+
+def make_native_source(repo, out, full):
+    src, version = changelog(os.path.join(repo, "debian"))
+    work = tempfile.mkdtemp(prefix=".pie-source-", dir=out)
+    try:
+        tree = os.path.join(work, "%s-%s" % (src, version))
+        assemble(repo, tree, full)
+        return finish(src, version, tree, work, out)
+    finally:
+        shutil.rmtree(work)
+
+
+def make_sloppy_source(repo, out, full):
+    """A 3.0 (quilt) package whose upstream is its own tree (gbp's
+    upstream-tree = SLOPPY): the orig is the assembled tree without debian/,
+    as a reproducible tar."""
+    src, version = changelog(os.path.join(repo, "debian"))
+    upver = upstream_version(version)
+    work = tempfile.mkdtemp(prefix=".pie-source-", dir=out)
+    try:
+        tree = os.path.join(work, "%s-%s" % (src, upver))
+        assemble(repo, tree, full)
+        debian = os.path.join(work, "debian")
+        shutil.move(os.path.join(tree, "debian"), debian)
+        when = output(["git", "log", "-1", "--format=%ct", "HEAD"], cwd=repo)
+        orig = os.path.join(work, "%s_%s.orig.tar.xz" % (src, upver))
+        tar = subprocess.Popen(["tar", "--sort=name", "--mtime=@" + when, "--owner=0", "--group=0",
+                                "--numeric-owner", "--format=gnu", "-cf", "-", "%s-%s" % (src, upver)],
+                               cwd=work, stdout=subprocess.PIPE)
+        with open(orig, "wb") as f:
+            run(["xz", "-6", "-T1", "-c"], stdin=tar.stdout, stdout=f)
+        if tar.wait() != 0:
+            die("tar of the upstream tree failed")
+        shutil.move(debian, os.path.join(tree, "debian"))
+        shutil.copy(orig, out)
+        return finish(src, version, tree, work, out)
+    finally:
+        shutil.rmtree(work)
+
+
+def make_source(repo, out, full):
+    if open(os.path.join(repo, "debian", "source", "format")).read().strip() == "3.0 (native)":
+        os.makedirs(out, exist_ok=True)
+        return make_native_source(repo, out, full)
+    if subprocess.run(["gbp", "config", "buildpackage.upstream-tree"], cwd=repo, capture_output=True,
+                      text=True).stdout.strip().upper() == "SLOPPY":
+        os.makedirs(out, exist_ok=True)
+        return make_sloppy_source(repo, out, full)
+    src, version, upver, tag, commit, origs = make_orig(repo, out, full)
+    if subprocess.run(["git", "diff", "--quiet", commit, "HEAD", "--", ".", ":(exclude)debian",
+                       ":(exclude).github", ":(exclude).gitignore"], cwd=repo).returncode != 0:
+        die("HEAD changes upstream files outside debian/: put those changes in debian/patches")
+    work = tempfile.mkdtemp(prefix=".pie-source-", dir=out)
+    try:
+        tree = os.path.join(work, "%s-%s" % (src, upver))
+        kept = set()
+        for comp, orig in origs:
+            shutil.copy(orig, work)
+            dest = os.path.join(tree, comp) if comp else work
+            os.makedirs(dest, exist_ok=True)
+            run(["tar", "-xf", orig, "-C", dest] + (["--strip-components=1"] if comp else []))
+            kept |= {(comp + "/" + n if comp else n) for n in tar_names(orig)}
+        os.makedirs(tree, exist_ok=True)
+        # The package's debian/ replaces any debian/ the upstream tree has.
+        shutil.rmtree(os.path.join(tree, "debian"), ignore_errors=True)
+        archive = subprocess.Popen(["git", "archive", "--format=tar", "HEAD", "debian"], cwd=repo,
+                                   stdout=subprocess.PIPE)
+        run(["tar", "-xf", "-", "-C", tree], stdin=archive.stdout)
+        if archive.wait() != 0:
+            die("git archive HEAD debian failed")
+        upstream = set(output(["git", "ls-tree", "-r", "--name-only", "-z", commit], cwd=repo).split("\0"))
+        for patch, path in created_by_patches(tree):
+            if path in upstream and path not in kept:
+                die("%s creates %s, which the source package leaves out" % (patch, path))
+        run(["dpkg-buildpackage", "-S", "-nc", "-d", "-us", "-uc",
+             "--source-option=--abort-on-upstream-changes"], cwd=tree,
+            stdout=subprocess.DEVNULL if os.environ.get("PIE_QUIET") else None)
+        for f in os.listdir(work):
+            if f.startswith(src + "_") and os.path.isfile(os.path.join(work, f)):
+                shutil.move(os.path.join(work, f), os.path.join(out, f))
+    finally:
+        shutil.rmtree(work)
+    dsc = os.path.join(out, "%s_%s.dsc" % (src, version.split(":", 1)[-1]))
+    print(dsc)
+    return dsc
+
+
+def dsc_files(dsc):
+    text = open(dsc).read()
+    m = re.search(r"^Files:\n((?: .*\n?)+)", text, re.M)
+    return [l.split()[2] for l in m.group(1).splitlines() if l.strip()]
+
+
+def build_binary(dsc, out, work, jobs, nodeps, nonet, arch):
+    dsc = os.path.abspath(dsc)
+    src, version = None, None
+    text = open(dsc).read()
+    src = re.search(r"^Source: (\S+)", text, re.M).group(1)
+    version = re.search(r"^Version: (\S+)", text, re.M).group(1).split(":", 1)[-1]
+    if os.path.exists(work):
+        shutil.rmtree(work)
+    os.makedirs(work)
+    tree = os.path.join(work, "src")
+    run(["dpkg-source", "-q", "-x", dsc, tree], stdout=subprocess.DEVNULL)
+    if os.path.exists(os.path.join(tree, ".git")):
+        die("the extracted source has .git")
+    cmd = ["dpkg-buildpackage", "-a", arch, "-b", "-us", "-uc", "-j%d" % jobs] + (["-d"] if nodeps else [])
+    if nonet:
+        cmd = ["unshare", "-n", "--"] + cmd
+    run(cmd, cwd=tree)
+    os.makedirs(out, exist_ok=True)
+    here = os.path.dirname(dsc)
+    for f in [os.path.basename(dsc)] + dsc_files(dsc):
+        if os.path.abspath(here) != os.path.abspath(out):
+            shutil.copy(os.path.join(here, f), out)
+    for f in os.listdir(work):
+        if f.endswith((".deb", ".udeb", ".buildinfo", ".changes")):
+            shutil.copy(os.path.join(work, f), out)
+    binary = "%s_%s_%s.changes" % (src, version, arch)
+    source = os.path.join(here, "%s_%s_source.changes" % (src, version))
+    if os.path.exists(source):
+        for f in (source, os.path.join(here, "%s_%s_source.buildinfo" % (src, version))):
+            if os.path.exists(f) and os.path.abspath(here) != os.path.abspath(out):
+                shutil.copy(f, out)
+        run(["mergechanges", "-f", os.path.basename(source), binary], cwd=out)
+        os.replace(os.path.join(out, "%s_%s_multi.changes" % (src, version)), os.path.join(out, binary))
+    print(os.path.join(out, binary))
+
+
+def main():
+    ap = argparse.ArgumentParser(usage=__doc__)
+    ap.add_argument("step", choices=["orig", "source", "binary"])
+    ap.add_argument("dsc", nargs="?")
+    ap.add_argument("-C", dest="repo", default=".")
+    ap.add_argument("-o", dest="out", default="../build-area")
+    ap.add_argument("--full", action="store_true")
+    ap.add_argument("--work")
+    ap.add_argument("-j", dest="jobs", type=int, default=os.cpu_count())
+    ap.add_argument("-d", dest="nodeps", action="store_true")
+    ap.add_argument("--no-network", action="store_true")
+    ap.add_argument("-a", dest="arch", default="darwin-arm64")
+    a = ap.parse_args()
+    out = os.path.abspath(a.out)
+    if a.step == "orig":
+        for comp, orig in make_orig(os.path.abspath(a.repo), out, a.full)[-1]:
+            print(orig)
+    elif a.step == "source":
+        make_source(os.path.abspath(a.repo), out, a.full)
+    else:
+        if not a.dsc:
+            die("binary needs a .dsc")
+        build_binary(a.dsc, out, os.path.abspath(a.work or os.path.join(out, ".binary")), a.jobs, a.nodeps,
+                     a.no_network, a.arch)
+
+
+if __name__ == "__main__":
+    main()

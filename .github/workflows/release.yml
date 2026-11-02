@@ -1,0 +1,41 @@
+name: release
+
+# Publishes build.yml's packages as the pushed tag's GitHub release
+# (build.yml has checked that the tag is debian/changelog's version's).
+# The calling job must grant contents: write and run only on a tag push; the
+# job runs in the repository's release environment, whose protection rules
+# can require approval and limit which tags may release.
+on:
+  workflow_call:
+    inputs:
+      artifact:
+        description: build.yml's artifact output (SOURCE_VERSION)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-26.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact }}
+          path: dist/
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber dist/*
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*
+          fi

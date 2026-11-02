@@ -1,0 +1,213 @@
+name: build
+
+# Builds a port's source package from its upstream tag and debian/, then its
+# binary packages from that source package alone, and uploads both as one
+# artifact, with contents: read only. attest.yml and release.yml publish
+# them, from jobs of their own that alone get write permissions.
+#
+# The source package keeps only the upstream files that debian/copyright's
+# Files-Excluded and Files-Included leave in, so a file left out cannot reach
+# the binary packages: the binary job never has the git checkout.
+on:
+  workflow_call:
+    inputs:
+      ports-repository:
+        description: >-
+          The ports' apt repository (deb822 URIs and Suites, such as
+          "https://example.org/debian blueberry-pie-os"), for ports whose
+          Build-Depends name other ports' darwin-arm64 packages
+        type: string
+        default: ''
+      ports-components:
+        description: The repository's components
+        type: string
+        default: 'core community extra'
+      ports-keyring-url:
+        description: Its signing key (an OpenPGP key file)
+        type: string
+        default: ''
+    outputs:
+      artifact:
+        description: The artifact holding the packages, SOURCE_VERSION (the version without its epoch)
+        value: ${{ jobs.binary.outputs.artifact }}
+
+env:
+  # This file is released only as this tag, and tags never move: the source
+  # job takes tools/ from the same tag.
+  WORKFLOWS_REF: v1
+  # pietoolchain's release holds both pietoolchain and pietoolchain-sdk.
+  PIETOOLCHAIN_VERSION: '0.1.0'
+  PIETOOLCHAIN_SHA256: baf60991468d48b7dc62761196a117437c8a0989a46bd200435d82d87ed7dc1d
+  PIETOOLCHAIN_SDK_SHA256: 3e8e01aeea1aed87ad1518ce3c6d673ae634a64e1b90d04c73ae8bdfe06943b2
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      name: ${{ steps.source.outputs.name }}
+    steps:
+      - name: Host packages
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git-buildpackage pristine-tar dpkg-dev devscripts lintian licenserecon xz-utils python3
+
+      - name: "Checkout: all branches and tags, for the upstream tag"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: The workflows' tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: blueberrypieos/workflows
+          ref: ${{ env.WORKFLOWS_REF }}
+          path: .workflows
+          persist-credentials: false
+
+      # A tag must be the changelog version's package tag (gbp.conf's
+      # debian-tag, with DEP-14 escaping: blueberry-pie-os/0.8.4+ds1-1);
+      # release.yml publishes such a tag's packages as its release.
+      - name: Check tag matches debian/changelog
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(dpkg-parsechangelog -SVersion)
+          tag=$(python3 -c 'import sys; from gbp.deb.git import DebianGitRepository; print(DebianGitRepository.version_to_tag(sys.argv[1], sys.argv[2]))' \
+            "$(gbp config buildpackage.debian-tag)" "$version")
+          if [ "$GITHUB_REF_NAME" != "$tag" ]; then
+            echo "tag $GITHUB_REF_NAME is not $tag, debian/changelog's version's" >&2
+            exit 1
+          fi
+
+      # The orig tarball comes from the upstream tag (gbp.conf's
+      # upstream-tag). With pristine-tar = True, its tarballs come from the
+      # pristine-tar branch, read as a local branch.
+      - name: The pristine-tar branch
+        run: |
+          if git rev-parse -q --verify refs/remotes/origin/pristine-tar >/dev/null; then
+            git branch -f pristine-tar origin/pristine-tar
+          fi
+
+      - name: Source package
+        id: source
+        run: |
+          python3 .workflows/tools/pie-source source -o "$RUNNER_TEMP/source"
+          source=$(dpkg-parsechangelog -SSource)
+          version=$(dpkg-parsechangelog -SVersion | sed 's/^[0-9]*://')
+          echo "name=${source}_${version}" >> "$GITHUB_OUTPUT"
+          ls -l "$RUNNER_TEMP/source"
+
+      # lintian's copyright tags, debian/copyright against every file of the
+      # source package, licensecheck through lrc, the restricted-text markers
+      # and files for other architectures.
+      - name: Check the source package
+        run: python3 .workflows/tools/pie-verify check "$RUNNER_TEMP/source/${{ steps.source.outputs.name }}.dsc"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.source.outputs.name }}_source
+          path: ${{ runner.temp }}/source/
+          if-no-files-found: error
+
+  binary:
+    needs: source
+    runs-on: ubuntu-26.04
+    # A clean system with no checkout: the build sees only the source
+    # package, pietoolchain, the SDK and the build dependencies.
+    container: ubuntu:26.04
+    permissions:
+      contents: read
+    outputs:
+      artifact: ${{ needs.source.outputs.name }}
+    steps:
+      - name: Host packages
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg dpkg-dev build-essential devscripts
+
+      - name: pietoolchain and pietoolchain-sdk
+        run: |
+          github=https://github.com/blueberrypieos
+          tc="pietoolchain_${PIETOOLCHAIN_VERSION}_amd64.deb"
+          sdk="pietoolchain-sdk_${PIETOOLCHAIN_VERSION}_all.deb"
+          curl -fsSL --retry 3 -o "/tmp/$tc" \
+            "$github/pietoolchain/releases/download/$PIETOOLCHAIN_VERSION/$tc"
+          curl -fsSL --retry 3 -o "/tmp/$sdk" \
+            "$github/pietoolchain/releases/download/$PIETOOLCHAIN_VERSION/$sdk"
+          printf '%s  %s\n' "$PIETOOLCHAIN_SHA256" "/tmp/$tc" \
+            "$PIETOOLCHAIN_SDK_SHA256" "/tmp/$sdk" | sha256sum -c -
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "/tmp/$tc" "/tmp/$sdk"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.source.outputs.name }}_source
+          path: /build/source/
+
+      - name: Extract the source package
+        run: dpkg-source -x "/build/source/${{ needs.source.outputs.name }}.dsc" /build/src
+
+      # Other ports' packages: the darwin-arm64 architecture and the ports'
+      # repository. pietoolchain-sdk provides core's runtime packages, so
+      # their Depends on core resolve without core's own packages.
+      - name: The ports' repository, for darwin-arm64 Build-Depends
+        if: inputs.ports-repository != ''
+        env:
+          REPO: ${{ inputs.ports-repository }}
+          COMPONENTS: ${{ inputs.ports-components }}
+          KEY_URL: ${{ inputs.ports-keyring-url }}
+        run: |
+          dpkg --add-architecture darwin-arm64
+          for f in /etc/apt/sources.list.d/*.sources; do
+            grep -q '^Architectures' "$f" || sed -i '/^Types/a Architectures: amd64' "$f"
+          done
+          curl -fsSL --retry 3 "$KEY_URL" | gpg --dearmor > /usr/share/keyrings/ports.gpg
+          set -- $REPO
+          printf 'Types: deb\nURIs: %s\nSuites: %s\nComponents: %s\nArchitectures: darwin-arm64\nSigned-By: /usr/share/keyrings/ports.gpg\n' \
+            "$1" "$2" "$COMPONENTS" > /etc/apt/sources.list.d/ports.sources
+          apt-get update
+
+      # With the ports' repository, pietoolchain's pie-cross-deps installs
+      # the build tools and unpacks other ports' darwin-arm64 packages into
+      # /var/lib/pietoolchain/cross-root (never into /usr), where rules.mk
+      # finds them; the build then skips dpkg's build-dependency check (-d).
+      - name: Build dependencies
+        id: deps
+        run: |
+          if [ -n '${{ inputs.ports-repository }}' ]; then
+            /usr/share/pietoolchain/pie-cross-deps /build/src
+            echo "check=-d" >> "$GITHUB_OUTPUT"
+          else
+            DEBIAN_FRONTEND=noninteractive apt-get build-dep -y --no-install-recommends /build/src
+          fi
+
+      - name: Binary packages
+        working-directory: /build/src
+        run: dpkg-buildpackage -a darwin-arm64 ${{ steps.deps.outputs.check }} -b -us -uc -j$(nproc)
+
+      # One .changes for the source and binary packages, under the name the
+      # binary build gives it; dist/ holds every file it lists.
+      - name: Packages
+        run: |
+          name='${{ needs.source.outputs.name }}'
+          cd /build
+          cp source/* .
+          mergechanges -f "${name}_source.changes" "${name}_darwin-arm64.changes"
+          mv "${name}_multi.changes" "${name}_darwin-arm64.changes"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "${name}_darwin-arm64.changes" "$GITHUB_WORKSPACE/dist/"
+          sed -n '/^Files:/,/^[^ ]/s/^ [0-9a-f]\{32\} [0-9]* [^ ]* [^ ]* //p' "${name}_darwin-arm64.changes" |
+            while read -r f; do cp "$f" "$GITHUB_WORKSPACE/dist/"; done
+          ls -l "$GITHUB_WORKSPACE/dist/"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.source.outputs.name }}
+          path: dist/
+          if-no-files-found: error

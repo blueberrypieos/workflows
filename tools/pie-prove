@@ -1,0 +1,94 @@
+#!/bin/bash
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 The Blueberry Pie OS Authors
+# usage: pie-prove REPO NAME [CHROOT] [JOBS]
+# Builds REPO's HEAD as a full and as a reduced source package, builds the
+# binary packages of each from its .dsc under pie-trace in CHROOT, compares
+# them (pie-verify compare) and checks the reduced one (pie-verify check).
+# debian/pie-leave-out, if there, is passed to pie-trace, and the installed
+# paths of those files are the only removals pie-verify compare accepts.
+# Writes OUT/NAME-{F,R,tF,tR} and OUT/NAME-prove.txt (OUT: $PIE_OUT, by
+# default ./pie-out).
+set -euo pipefail
+repo=$(realpath "$1") name=$2 root=${3:-/srv/claude-basic-ports} jobs=${4:-8}
+tools=$(dirname "$(realpath "$0")")
+out=$(realpath -m "${PIE_OUT:-pie-out}")
+# PIE_TRACE_ARGS: more pie-trace options for both builds (--map, --scope,
+# --arch, --build). PIE_PROVE_SOURCES=PREFIX: use the source packages in
+# PREFIX-F and PREFIX-R (another proof's, of the same commit).
+# PIE_PROVE_CHECK_ONLY=1: keep both builds' traces, and redo only the
+# analysis, comparison and checks.
+# PIE_PROVE_RESUME=1: keep NAME-F, NAME-R and NAME-tF if the full build's
+# trace is there, and go on from the reduced build.
+trace_args=(${PIE_TRACE_ARGS:-})
+mkdir -p "$out"
+src=$(dpkg-parsechangelog -l "$repo/debian/changelog" -SSource)
+ver=$(dpkg-parsechangelog -l "$repo/debian/changelog" -SVersion | sed 's/^[0-9]*://')
+leave=() allow=()
+if [ -f "$repo/debian/pie-leave-out" ]; then
+	leave=(--leave-out "$repo/debian/pie-leave-out")
+fi
+resume= checkonly=
+if [ -n "${PIE_PROVE_CHECK_ONLY:-}" ] && [ -f "$out/$name-tF/meta.json" ] && [ -f "$out/$name-tR/meta.json" ]; then
+	# Both builds are traced: only the analysis, comparison and checks again.
+	resume=1 checkonly=1
+elif [ -n "${PIE_PROVE_RESUME:-}" ] && [ -f "$out/$name-tF/meta.json" ]; then
+	# Go on from a proof that stopped after the full build's trace.
+	resume=1
+elif [ -n "${PIE_PROVE_SOURCES:-}" ]; then
+	rm -rf "$out/$name-F" "$out/$name-R"
+	# Another proof's source packages of the same commit (PREFIX-F, PREFIX-R).
+	cp -a "$PIE_PROVE_SOURCES-F" "$out/$name-F"
+	cp -a "$PIE_PROVE_SOURCES-R" "$out/$name-R"
+else
+	rm -rf "$out/$name-F" "$out/$name-R"
+	PIE_QUIET=1 "$tools/pie-source" source --full -C "$repo" -o "$out/$name-F" >/dev/null 2>"$out/$name-F.log"
+	PIE_QUIET=1 "$tools/pie-source" source -C "$repo" -o "$out/$name-R" >/dev/null 2>"$out/$name-R.log"
+fi
+# The full and the reduced build run at once, each in a slot of its own
+# (the same path in the chroot).
+fpid=
+if [ -n "$checkonly" ]; then
+	"$tools/pie-trace" --analyse "$out/$name-tR" "${trace_args[@]}" > "$out/$name-tR.txt"
+elif [ -z "$resume" ]; then
+	"$tools/pie-trace" --chroot "$root" "$out/$name-F/${src}_$ver.dsc" "$out/$name-tF" -j "$jobs" --name "$name" --full "${leave[@]}" "${trace_args[@]}" --slot F > "$out/$name-tF.txt" &
+	fpid=$!
+fi
+if [ -z "$checkonly" ] && ! "$tools/pie-trace" --chroot "$root" "$out/$name-R/${src}_$ver.dsc" "$out/$name-tR" -j "$jobs" --name "$name" "${trace_args[@]}" --slot R > "$out/$name-tR.txt"; then
+	[ -z "$fpid" ] || kill "$fpid"
+	exit 1
+fi
+[ -z "$fpid" ] || wait "$fpid"
+if [ -s "$out/$name-tF/left-out-used.txt" ]; then
+	# With the same maps and scopes as the trace, or reads through copies
+	# would look like new ones.
+	"$tools/pie-trace" --analyse "$out/$name-tF" "${leave[@]}" "${trace_args[@]}" >/dev/null
+	python3 - "$out/$name-tF" > "$out/$name-allow-missing.txt" <<'EOF'
+import os, sys, subprocess
+# Where each left-out file was installed: the copies the trace saw.
+out = sys.argv[1]
+left = [l.strip() for l in open(os.path.join(out, "left-out-used.txt")) if l.strip()]
+debs = os.path.join(out, "debs")
+paths = set()
+for deb in os.listdir(debs):
+    names = subprocess.run(["dpkg-deb", "--fsys-tarfile", os.path.join(debs, deb)], capture_output=True).stdout
+    listing = subprocess.run(["tar", "-t"], input=names, capture_output=True).stdout.decode().split("\n")
+    for p in listing:
+        p = p.lstrip("./")
+        # The installed copy ends with the file's directory and name
+        # (man3/cabs.3, csmapper/APPLE/...), wherever it was installed.
+        if any(p.endswith("/" + "/".join(l.split("/")[-2:])) for l in left):
+            paths.add(p)
+print("\n".join(sorted(paths)))
+EOF
+	allow=(--allow-missing "$out/$name-allow-missing.txt")
+fi
+{
+	echo "== $src $ver"
+	sed -n '2,3p;8p' "$out/$name-tF.txt"
+	"$tools/pie-verify" compare "$out/$name-tF" "$out/$name-tR" "${allow[@]}"
+	"$tools/pie-verify" check "$out/$name-R/${src}_$ver.dsc" --debs "$out/$name-tR/debs" --chroot "$root" \
+		--full-dsc "$out/$name-F/${src}_$ver.dsc"
+	echo "lintian:"
+	lintian --tag-display-limit 0 "$out/$name-R/${src}_$ver.dsc" || true
+} 2>&1 | tee "$out/$name-prove.txt"
