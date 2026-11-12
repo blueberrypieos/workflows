@@ -34,11 +34,11 @@ on:
 env:
   # This file is released only as this tag, and tags never move: the source
   # job takes tools/ from the same tag.
-  WORKFLOWS_REF: v1
+  WORKFLOWS_REF: v2
   # pietoolchain's release holds both pietoolchain and pietoolchain-sdk.
-  PIETOOLCHAIN_VERSION: '0.1.0'
-  PIETOOLCHAIN_SHA256: baf60991468d48b7dc62761196a117437c8a0989a46bd200435d82d87ed7dc1d
-  PIETOOLCHAIN_SDK_SHA256: 3e8e01aeea1aed87ad1518ce3c6d673ae634a64e1b90d04c73ae8bdfe06943b2
+  PIETOOLCHAIN_VERSION: '0.2.0'
+  PIETOOLCHAIN_SHA256: 495ced992885c4717bcb468607d473934aef74046d82dd54bae36777942f4c63
+  PIETOOLCHAIN_SDK_SHA256: 65568a3a247c9f457c9360342a2eeb74535e579e08a14a2933ca5d99ca89a709
 
 permissions:
   contents: read

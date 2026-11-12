@@ -1,0 +1,163 @@
+#!/bin/sh
+# pie-clean-matrix-cases WORKDIR: cases (f) to (h) of pie-clean-matrix, run as
+# root in the chroot. WORKDIR, under /tmp, holds the .dsc and its files. The
+# cases write f1 to f9, f-long, g and h-KIND in it, and remove f-long. None of
+# them may be there yet, and WORKDIR must be its own real path, with no symlink
+# or .. in it. The long-path case removes a /debian that it made. It exits
+# 0 only if every case passed.
+usage() { echo "usage: pie-clean-matrix-cases WORKDIR, a directory under /tmp: $1" >&2; exit 2; }
+case $1 in /tmp/[!/]*) ;; *) usage "not under /tmp" ;; esac
+[ -d "$1" ] && [ "$(realpath -e -- "$1")" = "$1" ] || usage "not a directory that is its own real path"
+for d in f1 f2 f3 f4 f5 f6 f7 f8 f9 f-long g h-root h-outside h-debian h-pie h-pie-bin h-stamp h-bin-dir h-pkg-config h-files-new; do
+	[ ! -e "$1/$d" ] && [ ! -L "$1/$d" ] || usage "$d is there already"
+done
+cm=$1
+B="dpkg-buildpackage -a darwin-arm64 -b -us -uc -d -j16"
+failed=0
+bad() { echo "$1"; failed=1; }
+show() { printf %s "$1" | tr '\n' '^'; }
+# snap DIR OUT: the state of DIR in OUT: type, mode, owner, mtime, link target
+# and sha256 of every entry. debian/'s own mtime is left out. If a step fails,
+# snap prints FAILED and the script fails. OUT then names DIR and OUT, so no
+# two failed snapshots are the same.
+snap() {
+	if ! (cd "$1" &&
+		find . -path ./debian -type d -printf "%y %m %U:%G debian\n" -o -printf "%y %m %U:%G %T@ %p %l\n" > "$2.l" &&
+		LC_ALL=C sort "$2.l" > "$2" &&
+		find . -type f -print0 > "$2.f" &&
+		LC_ALL=C sort -z "$2.f" > "$2.s" &&
+		xargs -0 -r sha256sum < "$2.s" >> "$2"); then
+		echo "the snapshot of $1 into $2 failed" > "$2"
+		echo "(snapshot) the snapshot of $(show "$1") FAILED"
+		failed=1
+	fi
+	rm -f "$2.l" "$2.f" "$2.s"
+}
+
+# (f) the tree unpacked under a name rules.mk cannot use, beside a directory
+# the unquoted path would reach: the path check stops clean and the build, and
+# neither the tree nor that directory changes.
+NL='
+'
+n=0
+# config.status turns q@prefix@ in srcdir into q/usr.
+for pair in 'pie ports:pie' 'R&D:R' 'R|D:R' 'x*:xyz' 'b[c]:bc' 'a$b:a' 'q@prefix@:q/usr' "a${NL} b:a" "tail${NL}:tail"; do
+	n=$((n+1)); name=${pair%%:*}; sib=${pair##*:}; s=$(show "$name")
+	if ! mkdir -p "$cm/f$n/$sib/src/debian/build" "$cm/f$n/$name" || ! echo canary > "$cm/f$n/$sib/src/debian/build/canary"; then
+		bad "(f) $s: the directories could not be made: case FAILED"; continue
+	fi
+	if ! (cd "$cm/f$n/$name" && dpkg-source -q -x "$cm"/*.dsc src > /dev/null 2>&1) || [ ! -f "$cm/f$n/$name/src/debian/rules" ]; then
+		bad "(f) $s: the tree did not unpack: case FAILED"; continue
+	fi
+	snap "$cm/f$n/$name/src" "$cm/f$n/tree.before"; snap "$cm/f$n/$sib" "$cm/f$n/sib.before"
+	(cd "$cm/f$n/$name/src" && debian/rules clean > ../f-c.log 2>&1) && bad "(f) $s: clean RAN"
+	(cd "$cm/f$n/$name/src" && $B > ../f-b.log 2>&1) && bad "(f) $s: the build RAN"
+	sleep 1
+	snap "$cm/f$n/$name/src" "$cm/f$n/tree.after"; snap "$cm/f$n/$sib" "$cm/f$n/sib.after"
+	tree=same; cmp -s "$cm/f$n/tree.before" "$cm/f$n/tree.after" || tree=CHANGED
+	sibd=same; cmp -s "$cm/f$n/sib.before" "$cm/f$n/sib.after" || sibd=CHANGED
+	stopped=no
+	grep -q "\*\*\* debian/rules: the path of the tree may have only" "$cm/f$n/$name/f-c.log" && grep -q "\*\*\* debian/rules: the path of the tree may have only" "$cm/f$n/$name/f-b.log" && stopped=yes
+	if [ $stopped = yes ] && [ $tree = same ] && [ $sibd = same ]; then
+		echo "(f) $s: the path check stopped clean and the build; the tree and $sib/ are unchanged"
+	else
+		bad "(f) $s: stopped by the path check: $stopped; the tree: $tree; $sib/: $sibd: case FAILED"
+	fi
+done
+
+# (f) a path longer than PATH_MAX: make cannot read it and leaves CURDIR empty.
+# debian/rules, run directly, stops at the path check for clean and for build,
+# the tree does not change, and nothing appears at /debian, where rules.mk
+# would then write.
+fl="$cm/f-long"
+there() { [ -e /debian ] || [ -L /debian ]; }
+debian_was=no; there && debian_was=yes
+if ! { mkdir -p "$fl" && (cd "$fl" && dpkg-source -q -x "$cm"/*.dsc src > /dev/null 2>&1); } || [ ! -f "$fl/src/debian/rules" ] || there; then
+	bad "(f) long path: the tree did not unpack, or /debian is there already: case FAILED"
+else
+	bash -c 'cd "$1" && c=$(printf "a%.0s" $(seq 1 200)) && for i in $(seq 1 21); do mkdir "$c" && cd "$c" || exit 1; done &&
+		mv "$1/src" src && cd src || exit 1
+		snap() {
+			find . -path ./debian -type d -printf "%y %m %U:%G debian\n" -o -printf "%y %m %U:%G %T@ %p %l\n" > "$1.l" &&
+			LC_ALL=C sort "$1.l" > "$1" && find . -type f -print0 > "$1.f" && LC_ALL=C sort -z "$1.f" > "$1.s" &&
+			xargs -0 -r sha256sum < "$1.s" >> "$1" || echo "the snapshot failed" > "$1"
+			rm -f "$1.l" "$1.f" "$1.s"
+		}
+		snap "$1/tree.before"
+		debian/rules clean > "$1/c.log" 2>&1 && echo "(f) long path: clean RAN"
+		debian/rules build > "$1/b.log" 2>&1 && echo "(f) long path: the build RAN"
+		snap "$1/tree.after"
+		exit 0' sh "$fl" > "$fl/ran.txt" 2>&1
+	[ -s "$fl/ran.txt" ] && bad "(f) long path FAILED: $(head -1 "$fl/ran.txt")"
+	stopped=no
+	grep -q "\*\*\* debian/rules: make does not see the path of the tree as the shell does" "$fl/c.log" && grep -q "\*\*\* debian/rules: make does not see the path of the tree as the shell does" "$fl/b.log" && stopped=yes
+	tree=CHANGED
+	if [ -s "$fl/tree.before" ] && ! grep -qx "the snapshot failed" "$fl/tree.before" && cmp -s "$fl/tree.before" "$fl/tree.after"; then tree=same; fi
+	if [ $stopped = yes ] && [ $tree = same ] && ! there; then
+		echo "(f) long path: the path check stopped clean and the build; the tree is unchanged; nothing at /debian"
+	else
+		bad "(f) long path: stopped by the path check: $stopped; the tree: $tree; /debian: $(there && echo made || echo absent): case FAILED"
+	fi
+fi
+rm -rf "$fl"
+# A failing case may have made /debian, which would stop every later run here.
+! there || [ "$debian_was" = yes ] || rm -rf /debian
+
+# (g) a symlink in the tree leads outside it. The build stops at the symlink
+# check, before anything writes through it. The files outside do not change.
+# clean succeeds. After it the tree is as before, links included, and
+# debian/build is gone. The files outside are still unchanged.
+{ mkdir -p "$cm/g/outside" && echo outside > "$cm/g/outside/VERSION" && (cd "$cm/g" && dpkg-source -q -x "$cm"/*.dsc src > /dev/null); } ||
+	bad "(g) the tree did not unpack: case FAILED"
+ln -s "$cm/g/outside/VERSION" "$cm/g/src/pie-matrix-outside-file" && ln -s ../outside "$cm/g/src/pie-matrix-outside-dir" ||
+	bad "(g) the links could not be made: case FAILED"
+snap "$cm/g/src" "$cm/g/g-before.txt"; snap "$cm/g/outside" "$cm/g/g-out-before.txt"
+(cd "$cm/g/src" && PIE_FULL_SOURCE=1 $B > ../g-b.log 2>&1) && bad "(g) the build RAN"
+grep -q "^debian/rules: .* leads outside the copy$" "$cm/g/g-b.log" && echo "(g) the build stopped at the symlink check" || bad "(g) the symlink check did not stop it: case FAILED"
+snap "$cm/g/outside" "$cm/g/g-out-after.txt"
+cmp -s "$cm/g/g-out-before.txt" "$cm/g/g-out-after.txt" && echo "(g) the files outside are unchanged" || bad "(g) the files outside CHANGED"
+if (cd "$cm/g/src" && debian/rules clean > ../g-c.log 2>&1); then
+	snap "$cm/g/src" "$cm/g/g-after.txt"; snap "$cm/g/outside" "$cm/g/g-out-clean.txt"
+	if cmp -s "$cm/g/g-before.txt" "$cm/g/g-after.txt" && cmp -s "$cm/g/g-out-before.txt" "$cm/g/g-out-clean.txt"; then
+		echo "(g) after clean the tree is as before, links included, and the files outside are unchanged"
+	else
+		bad "(g) after clean the tree or the files outside are DIFFERENT"
+	fi
+else
+	bad "(g) clean failed: case FAILED"
+fi
+
+# (h) a symlink where debian/rules and rules.mk would write through it: the
+# build stops at the symlink check, and nothing in the tree, the links included,
+# or outside changes.
+# Most kinds need a build without clean, with -nc. files.new needs a normal build.
+for kind in root outside debian pie pie-bin stamp bin-dir pkg-config files-new; do
+	h="$cm/h-$kind"
+	if ! { mkdir -p "$h/out" && echo sentinel > "$h/out/keep" && (cd "$h" && dpkg-source -q -x "$cm"/*.dsc src > /dev/null); }; then
+		bad "(h) $kind: the tree did not unpack: case FAILED"; continue
+	fi
+	nc=-nc; [ $kind = files-new ] && nc=
+	if ! (set -e
+	case $kind in
+	root) ln -s .. "$h/src/debian/build" ;;
+	outside) ln -s "$h/out" "$h/src/debian/build" ;;
+	debian) mv "$h/src/debian" "$h/out/debian" && ln -s "$h/out/debian" "$h/src/debian" ;;
+	pie) mkdir -p "$h/src/debian/build" "$h/out/bin" && ln -s "$h/out" "$h/src/debian/build/pie" ;;
+	pie-bin) mkdir -p "$h/src/debian/build/pie" "$h/out/bin" && ln -s "$h/out/bin" "$h/src/debian/build/pie/bin" ;;
+	stamp) mkdir -p "$h/src/debian/build" && ln -s "$h/out/made" "$h/src/debian/build/stamp-pie" ;;
+	bin-dir) mkdir -p "$h/src/debian/build/pie/bin" "$h/out/tools" && ln -s "$h/out/tools" "$h/src/debian/build/pie/bin/otool" ;;
+	pkg-config) mkdir -p "$h/src/debian/build/pie/bin" && ln -s "$h/out/keep" "$h/src/debian/build/pie/bin/pkg-config-darwin" ;;
+	files-new) ln -s "$h/out/keep" "$h/src/debian/files.new" ;;
+	esac); then
+		bad "(h) $kind: the links could not be made: case FAILED"; continue
+	fi
+	snap "$h/src" "$h/h-before.txt"; snap "$h/out" "$h/h-out-before.txt"
+	(cd "$h/src" && $B $nc > ../h-b.log 2>&1) && bad "(h) $kind: the build RAN"
+	snap "$h/src" "$h/h-after.txt"; snap "$h/out" "$h/h-out-after.txt"
+	if grep -q "\*\*\* debian/rules: debian, debian/build or something rules.mk writes in it is a symlink" "$h/h-b.log" && cmp -s "$h/h-before.txt" "$h/h-after.txt" && cmp -s "$h/h-out-before.txt" "$h/h-out-after.txt"; then
+		echo "(h) $kind link: the build stopped at the symlink check; nothing changed"
+	else
+		bad "(h) $kind link: something CHANGED or the build was not stopped by the symlink check: case FAILED"
+	fi
+done
+exit $failed

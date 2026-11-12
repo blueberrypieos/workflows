@@ -1,0 +1,226 @@
+#!/bin/bash -p
+# pie-clean-matrix DSC REPO CHROOT [WORKDIR]: the build must leave the tree as it was.
+# It exits 0 only if every case ran and passed.
+# WORKDIR is a path under /tmp in CHROOT, by default /tmp/cm-NAME-PID. It is
+# removed first, and kept afterwards with the logs. The builds keep their
+# temporary files in it. It may not be reached through a symlink, may not
+# have a . or .. or an empty name, and may not hold REPO, DSC, a file beside
+# DSC, or a link on the way to one of them.
+# Case (f) removes a /debian in CHROOT that its long path made.
+# The arguments may have only letters, digits and /._+~-. The directory of DSC
+# is copied whole, and may hold only one .dsc. The debian tarball that DSC
+# lists must have its sha256, and the same debian/ as REPO's HEAD. Start it
+# as a command, by its #! line: started as "bash pie-clean-matrix", exported
+# functions reach it.
+# The cases run as root of a user namespace, so CHROOT must belong to the
+# caller. They run with pie-trace's environment, not the caller's: HOME,
+# LANG, LOGNAME, SHELL, TERM, USER and PATH, and TMPDIR in WORKDIR. The
+# matrix itself sees only PATH and TMPDIR of the caller's environment, with
+# LC_ALL=C.UTF-8 and HOME=/nonexistent.
+#  (a) build, clean, build from the .dsc: the same set of debs, each identical; tree as unpacked
+#  (b) two failed autoreconfs, a good build, clean: tree as unpacked
+#  (c) a git clone of REPO, with the full upstream tree and debian/: a full build
+#      at another path gives the same debs as (a); commit a file, add an untracked
+#      one, build again without clean, clean: git status as before, both files
+#      as they were, and the clone's types, modes, owners, links and contents too.
+#      The first build changes none of those either. The clone's snapshot leaves
+#      out what clean removes and .git/index. dpkg-source applies and removes the
+#      patches in the clone, so its mtimes are not compared.
+#  (d) the build killed during autoreconf, during configure and while compiling,
+#      then clean: the build died of SIGKILL, nothing is left of its session;
+#      tree as unpacked
+#  (e) the git clone again: a build killed during autoreconf, clean, then
+#      dpkg-source --after-build, since dpkg-source applied the patches: nothing
+#      left of the build's session; git status and the clone as before
+#  (f) unpacked under paths with a space, &, |, $, @NAME@, glob characters or a newline,
+#      beside a directory the unquoted path would reach, and under a path longer
+#      than PATH_MAX: clean and the build stop, and the other directory is kept
+#  (g) a symlink leading outside the tree: the build stops, nothing outside changes
+#  (h) a symlink at debian, at debian/build, at debian/files.new, or where rules.mk
+#      writes in debian/build: pie, pie/bin, stamp-pie, pie/bin/pkg-config-darwin, or a tool
+#      link that leads to a directory. The build stops. Nothing in the tree or
+#      outside changes.
+#  "As unpacked": each tree's own snapshot after dpkg-source -x records type, mode,
+#  owner, mtime, link target and sha256 of every entry, with debian/'s mtime left
+#  out, and its contents equal a fresh unpack.
+if [ $# -lt 3 ]; then sed -n '2,/^[^#]/{/^#/s/^# \{0,1\}//p}' "${BASH_SOURCE[0]}" >&2; exit 2; fi
+fixed=yes
+for v in $(compgen -e); do
+	case " PATH TMPDIR LC_ALL HOME PWD SHLVL OLDPWD _ PIE_FIXED " in *" $v "*) ;; *) fixed=no ;; esac
+done
+[ "${LC_ALL:-}" = C.UTF-8 ] && [ "${HOME:-}" = /nonexistent ] && [ -z "$(declare -Fx)" ] || fixed=no
+if [ $fixed = no ]; then
+	[ -z "${PIE_FIXED:-}" ] || { echo "pie-clean-matrix: the environment is still not fixed" >&2; exit 1; }
+	exec env -i PATH="$PATH" ${TMPDIR+TMPDIR="$TMPDIR"} LC_ALL=C.UTF-8 HOME=/nonexistent PIE_FIXED=1 \
+		bash -p "$(realpath "${BASH_SOURCE[0]}")" "$@"
+fi
+dsc=$1 repo=$2 c=$3 cm=${4:-/tmp/cm-$(basename "$1" .dsc)-$$}
+for a in "$dsc" "$repo" "$c" "$cm"; do
+	case $a in
+	''|*[!A-Za-z0-9/._+~-]*) echo "pie-clean-matrix: the arguments may have only letters, digits and /._+~-: $a" >&2; exit 1 ;;
+	esac
+done
+case $cm in /tmp/[!/]*) ;; *) echo "pie-clean-matrix: WORKDIR must be under /tmp: $cm" >&2; exit 1 ;; esac
+case $cm/ in */./*|*/../*|*//*) echo "pie-clean-matrix: WORKDIR may not have . or .. or an empty name: $cm" >&2; exit 1 ;; esac
+[ -x $c/usr/bin/dpkg-buildpackage ] || { echo "pie-clean-matrix: CHROOT has no dpkg-buildpackage: $c" >&2; exit 1; }
+# No symlink may be on the way to WORKDIR, or rm -rf would follow it.
+cr=$(realpath -e -- $c) && [ "$(realpath -m -- $c$cm)" = "$cr$cm" ] || { echo "pie-clean-matrix: WORKDIR is reached through a symlink: $c$cm" >&2; exit 1; }
+# Nor may WORKDIR be on the way to REPO, DSC or a file beside DSC, links followed.
+python3 -I - "$cr$cm" $repo $(dirname $dsc) $dsc $(dirname $dsc)/* <<'EOF' || exit 1
+import os, sys
+top, paths = sys.argv[1], sys.argv[2:]
+def traversed(path):
+    out, cur, todo, hops = [], "/", [c for c in os.path.join(os.getcwd(), path).split("/") if c], 0
+    while todo:
+        c = todo.pop(0)
+        if c == ".":
+            continue
+        if c == "..":
+            cur = os.path.dirname(cur)
+            continue
+        e = os.path.join(cur, c)
+        out.append(e)
+        if os.path.islink(e) and hops < 40:
+            hops += 1
+            t = os.readlink(e)
+            todo = [x for x in t.split("/") if x] + todo
+            cur = "/" if t.startswith("/") else cur
+        else:
+            cur = e
+    return out
+for p in paths:
+    for e in traversed(p):
+        if e == top or e.startswith(top + "/"):
+            sys.exit("pie-clean-matrix: WORKDIR holds %s, which is on the way to %s and would be removed" % (e, p))
+EOF
+rm -rf $c$cm && mkdir -p $c$cm || exit 1
+cp $(dirname $dsc)/* $c$cm/ || exit 1
+[ "$(ls $c$cm | grep -c "\.dsc$")" = 1 ] || { echo "pie-clean-matrix: the .dsc's directory holds more than one .dsc" >&2; exit 1; }
+# The clone takes no template, configuration or replace refs of the caller's.
+G="env -i PATH=$PATH GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 git"
+$G clone -q --no-hardlinks --template= $repo $c$cm/git || exit 1
+ia=$($G -C $c$cm/git rev-parse --git-path info/attributes) || exit 1
+case $ia in /*) ;; *) ia=$c$cm/git/$ia ;; esac
+! grep -qv '^[[:space:]]*\(#.*\)\{0,1\}$' $ia 2>/dev/null || { echo "pie-clean-matrix: the clone's info/attributes has rules: $ia" >&2; exit 1; }
+# The .dsc's debian/ must be HEAD's: the same entries, types, executable
+# bits, link targets and contents.
+manifest() { ( set -o pipefail; cd "$1" && find debian \( -type d -printf "d %p\n" -o -type l -printf "l %p %l\n" -o -type f -perm -u+x -printf "x %p\n" -o -type f -printf "f %p\n" -o -printf "? %y %p\n" \) | LC_ALL=C sort && find debian -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum ); }
+t=$(mktemp -d) && mkdir $t/dsc $t/git || exit 1
+# The debian tarball is the one the .dsc lists, with its sha256.
+read -r dsum dtar n <<< "$(awk '/^Checksums-Sha256:/ {f = 1; next} /^[^ ]/ {f = 0} f && $3 ~ /\.debian\.tar\.[a-z0-9]+$/ {print $1, $3; n++} END {print n + 0}' $dsc | tr '\n' ' ')"
+case $dtar in ''|*[!A-Za-z0-9._+~-]*) dtar= ;; esac
+if [ "$n" != 1 ] || [ -z "$dtar" ] || [ "$(sha256sum < $(dirname $dsc)/$dtar | cut -d' ' -f1)" != "$dsum" ] ||
+	! tar -xf $(dirname $dsc)/$dtar -C $t/dsc || ! ( set -o pipefail; $G -C $c$cm/git -c core.autocrlf=false -c core.eol=lf \
+		-c core.attributesFile=/dev/null archive HEAD debian | tar -x -C $t/git ) ||
+	! manifest $t/dsc > $t/dsc.txt || ! manifest $t/git > $t/git.txt || ! cmp -s $t/dsc.txt $t/git.txt; then
+	rm -rf $t; echo "pie-clean-matrix: the .dsc's debian/ is not the one at REPO's HEAD" >&2; exit 1
+fi
+rm -rf $t
+cp "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/pie-clean-matrix-cases" $c$cm/f-inner.sh || exit 1
+echo "matrix of $(basename $dsc) $(sha256sum < $dsc | cut -c1-16), clone at $(git -C $c$cm/git log -1 --format=%h)"
+out=$(mktemp) || exit 1
+unshare --map-auto --map-root-user --pid --fork --mount sh -c "mount --rbind /dev $c/dev && mount -t proc proc $c/proc && chroot $c env -i HOME=/root LANG=C.UTF-8 LOGNAME=root SHELL=/bin/bash TERM=unknown USER=root \
+	PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin sh -c '
+set -e
+export TMPDIR=$cm/tmp && mkdir -p $cm/tmp
+B=\"dpkg-buildpackage -a darwin-arm64 -b -us -uc -d -j16\"
+cd $cm && dpkg-source -q -x $(basename $dsc) fresh >/dev/null 2>&1
+snap() { (cd \"\$1\" && find . -path ./debian/build -prune -o -path ./debian -printf \"%y %m %U:%G debian\\n\" -o -printf \"%y %m %U:%G %T@ %p %l\\n\" > \"\$2.l\" && LC_ALL=C sort \"\$2.l\" > \"\$2\" && find . -path ./debian/build -prune -o -type f -print0 > \"\$2.f\" && LC_ALL=C sort -z \"\$2.f\" > \"\$2.s\" && xargs -0 -r sha256sum < \"\$2.s\" >> \"\$2\") && rm -f \"\$2.l\" \"\$2.f\" \"\$2.s\"; }
+for t in a b d-autoreconf d-configure d-compile; do dpkg-source -q -x $(basename $dsc) \$t >/dev/null 2>&1; snap $cm/\$t $cm/snap-\$t.before; done
+gsnap() { (set -f; ex=\"-path ./debian/build -o -path ./.git/index -o -path ./debian/files -o -regex \\\\./debian/[^/]*\\\\.substvars\"; for p in \$(sed -n \"s/^Package: *//p\" \"\$1/debian/control\"); do ex=\"\$ex -o -path ./debian/\$p\"; done; cd \"\$1\" && find . \\( \$ex \\) -prune -o -printf \"%y %m %U:%G %p %l\\n\" > \"\$2.l\" && LC_ALL=C sort \"\$2.l\" > \"\$2\" && find . \\( \$ex \\) -prune -o -type f -print0 > \"\$2.f\" && LC_ALL=C sort -z \"\$2.f\" > \"\$2.s\" && xargs -0 -r sha256sum < \"\$2.s\" >> \"\$2\") && rm -f \"\$2.l\" \"\$2.f\" \"\$2.s\"; }
+same() { t=\$(basename \$1); snap \"\$1\" $cm/snap-\$t.after; diff $cm/snap-\$t.before $cm/snap-\$t.after > $cm/diff-\$2.txt && diff -r --no-dereference $cm/fresh \"\$1\" >> $cm/diff-\$2.txt && echo \"(\$2) tree as unpacked: contents, modes, owners and mtimes\" || { echo \"(\$2) tree DIFFERS:\"; head -8 $cm/diff-\$2.txt; }; }
+
+cd $cm/a
+\$B > ../a1.log 2>&1 || { echo \"(a) build 1 FAILED\"; tail -5 ../a1.log; exit 1; }
+mkdir ../a-d1 && mv ../*.deb ../a-d1/
+debian/rules clean > ../a-c.log 2>&1
+same $cm/a a-after-clean
+\$B > ../a2.log 2>&1 || { echo \"(a) build 2 FAILED\"; tail -5 ../a2.log; exit 1; }
+mkdir ../a-d2 && mv ../*.deb ../a-d2/
+[ \"\$(ls ../a-d1)\" = \"\$(ls ../a-d2)\" ] && echo \"(a) same set of debs: \$(echo \$(ls ../a-d1))\" || echo \"(a) DIFFERENT set of debs: \$(echo \$(ls ../a-d1)) and \$(echo \$(ls ../a-d2))\"
+for f in ../a-d1/*.deb; do cmp -s \$f ../a-d2/\$(basename \$f) && echo \"(a) same deb: \$(basename \$f)\" || echo \"(a) DIFFERENT deb: \$(basename \$f)\"; done
+rm -f ../*.deb ../*.buildinfo ../*.changes
+debian/rules clean > ../a-c2.log 2>&1
+same $cm/a a-after-second-clean
+
+cd $cm/b
+AUTOMAKE=/bin/false \$B -nc > ../b1.log 2>&1 && echo \"(b) UNEXPECTED: failed run 1 passed\" || true
+AUTOMAKE=/bin/false \$B -nc > ../b2.log 2>&1 && echo \"(b) UNEXPECTED: failed run 2 passed\" || true
+\$B -nc > ../b3.log 2>&1 || { echo \"(b) the good build FAILED\"; tail -5 ../b3.log; exit 1; }
+rm -f ../*.deb ../*.buildinfo ../*.changes
+debian/rules clean > ../b-c.log 2>&1
+same $cm/b b
+
+started() { case \$1 in
+autoreconf) ps -eo comm | grep -qx -e autoreconf -e autom4te -e aclocal -e automake ;;
+configure) ps -eo args | grep -q \"/debian/build/src/[c]onfigure\" ;;
+compile) [ -e debian/build/obj/.configured ] && ps -eo comm | grep -qx -e clang -e \"clang-[0-9]*\" ;;
+esac; }
+for pt in autoreconf configure compile; do
+cd $cm/d-\$pt
+setsid \$B > ../d-\$pt.log 2>&1 & bp=\$!
+n=0; until started \$pt; do sleep 0.05; n=\$((n+1)); [ \$n -lt 6000 ] || { echo \"(d) the build never reached \$pt: case FAILED\"; exit 1; }; done
+pkill -KILL -g \$bp && killed=yes || killed=no; rc=0; wait \$bp 2>/dev/null || rc=\$?; sleep 1
+ps -eo sid=,stat= > \$TMPDIR/ps.txt && left=\$(grep -c \"^ *\$bp [^Z]\" \$TMPDIR/ps.txt || true) || left=unknown
+if [ \$killed = yes ] && [ \$rc = 137 ] && [ \"\$left\" = 0 ]; then echo \"(d) build killed during \$pt: no build process left\"; else echo \"(d) build during \$pt: killed \$killed, exit \$rc, \$left build processes left: case FAILED\"; fi
+debian/rules clean > ../d-\$pt-c.log 2>&1
+same $cm/d-\$pt d
+done
+
+cd $cm/git && git config user.name t && git config user.email t
+git status --porcelain --ignored > ../g-before.raw && sort ../g-before.raw > ../g-before.txt
+rm -f $cm/*.deb
+gsnap $cm/git $cm/c-tree.first
+PIE_FULL_SOURCE=1 \$B -nc > ../g1.log 2>&1 || { echo \"(c) full build 1 FAILED\"; tail -5 ../g1.log; exit 1; }
+gsnap $cm/git $cm/c-tree.built
+cmp -s $cm/c-tree.first $cm/c-tree.built && echo \"(c) the first build changed the clone only where clean removes\" || echo \"(c) the clone DIFFERS after the first build\"
+mkdir $cm/c-d1 && mv $cm/*.deb $cm/c-d1/
+[ \"\$(ls $cm/a-d1)\" = \"\$(ls $cm/c-d1)\" ] && echo \"(c) same set of debs as (a): \$(echo \$(ls $cm/c-d1))\" || echo \"(c) DIFFERENT set of debs from (a): \$(echo \$(ls $cm/a-d1)) and \$(echo \$(ls $cm/c-d1))\"
+for f in $cm/a-d1/*.deb; do cmp -s \$f $cm/c-d1/\$(basename \$f) && echo \"(c) same deb as (a), built at another path: \$(basename \$f)\" || echo \"(c) DIFFERENT deb from (a): \$(basename \$f)\"; done
+echo user > user-committed.c && git add -f user-committed.c && git commit -qm t && echo user > user-untracked.c
+userfiles() { { stat -c \"%F %a %u:%g %Y %s %n\" user-committed.c user-untracked.c; sha256sum user-committed.c user-untracked.c; } 2>&1 || true; }
+userfiles > ../c-users.before
+gsnap $cm/git $cm/c-tree.before
+rm -f debian/build/stamp-build
+PIE_FULL_SOURCE=1 \$B -nc > ../g2.log 2>&1 || { echo \"(c) full build 2 FAILED\"; tail -5 ../g2.log; exit 1; }
+debian/rules clean > ../g-c.log 2>&1
+gsnap $cm/git $cm/c-tree.after
+cmp -s $cm/c-tree.before $cm/c-tree.after && echo \"(c) the clone is as before the second build: types, modes, owners, links and contents\" || echo \"(c) the clone DIFFERS after the second build and clean\"
+git status --porcelain --ignored > ../g-after.raw && grep -v \"^?? user-untracked.c\$\" ../g-after.raw | sort > ../g-after.txt || true
+diff ../g-before.txt ../g-after.txt > ../g-diff.txt && echo \"(c) git status as before\" || { echo \"(c) git status DIFFERS:\"; head -8 ../g-diff.txt; }
+userfiles > ../c-users.after
+cmp -s ../c-users.before ../c-users.after && git diff --quiet HEAD && echo \"(c) both user files kept as they were, no tracked file changed\" || echo \"(c) user files or tracked files CHANGED\"
+git fsck --no-progress > ../g-fsck.log 2>&1 && echo \"(c) git fsck ok\" || echo \"(c) git fsck FAILED\"
+git reset -q --hard HEAD~1 && rm -f user-untracked.c && git clean -qfdx -e debian/build > /dev/null && rm -rf debian/build
+git status --porcelain --ignored > ../e-before.raw && sort ../e-before.raw > ../e-before.txt
+gsnap $cm/git $cm/e-tree.before
+setsid sh -c \"PIE_FULL_SOURCE=1 \$B -nc > ../e1.log 2>&1\" & bp=\$!
+n=0; until ps -eo comm | grep -qx -e autoreconf -e autom4te -e aclocal -e automake; do sleep 0.05; n=\$((n+1)); [ \$n -lt 2400 ] || { echo \"(e) autoreconf never started: case FAILED\"; exit 1; }; done
+pkill -KILL -g \$bp && killed=yes || killed=no; rc=0; wait \$bp 2>/dev/null || rc=\$?; sleep 1
+ps -eo sid=,stat= > \$TMPDIR/ps.txt && left=\$(grep -c \"^ *\$bp [^Z]\" \$TMPDIR/ps.txt || true) || left=unknown
+if [ \$killed = yes ] && [ \$rc = 137 ] && [ \"\$left\" = 0 ]; then echo \"(e) build killed during autoreconf: no build process left\"; else echo \"(e) build during autoreconf: killed \$killed, exit \$rc, \$left build processes left: case FAILED\"; fi
+debian/rules clean > ../e-c.log 2>&1
+[ -e .pc/.dpkg-source-unapply ] && echo \"(e) killed during autoreconf; dpkg-source left its patches applied\" || echo \"(e) the patches were not left applied: case FAILED\"
+dpkg-source --after-build . > ../e-ab.log 2>&1
+gsnap $cm/git $cm/e-tree.after
+cmp -s $cm/e-tree.before $cm/e-tree.after && echo \"(e) the clone is as before: types, modes, owners, links and contents\" || echo \"(e) the clone DIFFERS after clean and dpkg-source --after-build\"
+git status --porcelain --ignored > ../e-after.raw && sort ../e-after.raw > ../e-after.txt
+diff ../e-before.txt ../e-after.txt > ../e-diff.txt && echo \"(e) after dpkg-source --after-build, git status as before\" || { echo \"(e) git status DIFFERS:\"; head -8 ../e-diff.txt; }
+sh $cm/f-inner.sh $cm > $cm/fgh.out 2> $cm/fgh.err || { echo \"(fgh) the cases script exited \$?: case FAILED\"; grep \"^([fgh])\" $cm/fgh.out; exit 1; }
+grep \"^([fgh])\" $cm/fgh.out
+echo \"(end) every case ran\"
+'" | tee $out
+rc=${PIPESTATUS[0]}
+# The matrix passes only when the runner finished and every case passed.
+fail() { rm -f $out; echo "pie-clean-matrix: FAILED: $1" >&2; exit 1; }
+[ "$rc" = 0 ] || fail "the runner exited $rc"
+grep -qx '(end) every case ran' $out || fail "the runner did not finish"
+! grep -q 'UNEXPECTED\|DIFFERS\|DIFFERENT\|CHANGED\|GONE\|RAN\|FAILED\|: no;' $out || fail "a case FAILED"
+# Each group's verdicts. (a) and (c) have one for the set of debs and one for each deb.
+debs=$(grep -c '^(a) same deb: ' $out)
+[ "$debs" -ge 1 ] || fail "case (a) compared no deb"
+for g in a:$((debs + 3)) b:1 c:$((debs + 6)) d:6 e:4 f:10 g:3 h:9; do
+	n=$(grep -c "^(${g%:*}[-)]" $out)
+	[ "$n" = "${g#*:}" ] || fail "case (${g%:*}) has $n verdicts, not ${g#*:}"
+done
+rm -f $out

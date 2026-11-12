@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2026 The Blueberry Pie OS Authors
 """usage: pie-trace --chroot ROOT DSC OUT [-j N] [-d] [--name NAME] [--leave-out FILE] [--full]
@@ -12,8 +12,32 @@ of the orig tarball(s) into:
              whole-tree copy steps (tar, cp -a) count for the file copied.
   stat       only checked for existence
   untouched  never seen
-OUT gets trace.log, build.log, debs/, files.tsv, outside.txt, kept.txt,
-files-included.txt and report.txt. --analyse redoes the sorting.
+The build runs in ROOT/work/trace-NAME, or trace-NAME@SLOT with --slot,
+which is removed first and may not be reached through a symlink. With
+--slot it is mounted at ROOT/work/trace-NAME, which is made and left. NAME
+is by default the .dsc's Source. NAME and SLOT have only letters, digits and
+._+- and start with a letter or digit. The names of the .dsc and of the files
+it lists follow the same rule, with ~ allowed too. --arch has only lower-case
+letters, digits and -.
+OUT is removed and made anew. It gets meta.json, trace.log, build.log, debs/,
+files.tsv, outside.txt, kept.txt, left-out-used.txt, files-included.txt,
+tree-changes.txt and report.txt. --analyse redoes the sorting. OUT may not
+be in ROOT/work, or be or hold ROOT, ROOT/work or the work directory.
+Neither OUT nor the work directory may hold the .dsc, a file it lists, the
+--leave-out or --keep file, ROOT, or a link on the way to one. ROOT may
+not be /, and OUT may not be in ROOT. --analyse refuses an OUT that is a
+link, and writes its analysis files anew. Each command pie-trace runs in
+ROOT gets an empty /tmp of its own.
+-j N sets the build's jobs, by default the number of CPUs. -d passes -d to
+dpkg-buildpackage. pie-trace and what it runs see only PATH, TMPDIR and
+PIE_UNSHARE of the caller's environment, with LC_ALL=C.UTF-8 and
+HOME=/nonexistent.
+The build must leave the extracted tree as it was, apart from what
+rules.mk's clean removes: debian/build, debian/PACKAGE, debian/files and
+debian/*.substvars. pie-trace compares every path's type, mode, owner,
+modification time, link target and contents before and after the build.
+Only debian/'s own modification time is left out. It lists any change in
+tree-changes.txt and fails.
 --unshare (or PIE_UNSHARE=1) runs the build in a user namespace, without sudo,
 for a chroot that belongs to the user.
 --arch is the architecture to build for (darwin-arm64; host builds for the
@@ -45,6 +69,7 @@ tarball is its whole source.
 """
 import argparse
 import collections
+import hashlib
 import json
 import os
 import re
@@ -107,15 +132,17 @@ def in_root(root, script, wrap=(), bind=None):
     are root, with /dev and /proc mounted. WRAP runs inside the namespace,
     after newuidmap (setuid, which a traced process cannot use), with the
     namespace's own /proc. BIND=(HOSTDIR, INSIDE) mounts HOSTDIR at INSIDE
-    in the chroot, in a mount namespace of the command's own."""
+    in the chroot, in a mount namespace of the command's own. The command
+    gets an empty /tmp of its own, a tmpfs."""
     if not UNSHARE:
-        if not bind:
-            return ["sudo", "-n"] + list(wrap) + ["chroot", root, "/bin/sh", "-c", script]
         return ["sudo", "-n", "unshare", "--mount", "/bin/sh", "-c",
-                'r=$1 h=$2 i=$3; shift 3; mkdir -p "$r$i" && mount --bind "$h" "$r$i" && exec "$@"',
-                "sh", root, bind[0], bind[1]] + list(wrap) + ["chroot", root, "/bin/sh", "-c", script]
+                'r=$1 h=$2 i=$3; shift 3; mount -t tmpfs -o mode=1777 tmpfs "$r/tmp" && '
+                '{ [ -z "$h" ] || { mkdir -p "$r$i" && mount --bind "$h" "$r$i"; }; } && exec "$@"',
+                "sh", root, bind[0] if bind else "", bind[1] if bind else ""] + list(wrap) + ["chroot", root, "/bin/sh", "-c", script]
     proc = "mount -t proc proc /proc && " if wrap else ""
     mnt = 'mkdir -p "$0$3" && mount --bind "$2" "$0$3" && ' if bind else ""
+    # A /tmp of its own: the build cannot read what other builds and matrices left in the chroot's.
+    mnt += 'mount -t tmpfs -o mode=1777 tmpfs "$0/tmp" && '
     return ["unshare"] + id_map() + ["--mount", "--pid", "--fork", "/bin/sh", "-c",
             proc + mnt + 'mount --rbind /dev "$0/dev" && mount -t proc proc "$0/proc" && exec %s chroot "$0" /bin/sh -c "$1"'
             % shlex.join(["env", "-i"] + SUDO_ENV + list(wrap)), root, script] + (list(bind) if bind else [])
@@ -130,8 +157,10 @@ def dsc_fields(dsc):
 
 
 def orig_members(dscdir, files):
-    """{tree path: tar type char} for the orig tarball and its components."""
-    members = {}
+    """{tree path: tar type char} for an orig tarball and its components, or for
+    a native tarball. Also the debian/ entries of an orig tarball, which
+    dpkg-source replaces."""
+    members, debian = {}, []
     for f in files:
         m = re.match(r".*\.orig(?:-([A-Za-z0-9][-A-Za-z0-9]*))?\.tar\.\w+$", f)
         native = not m and re.match(r".*\.tar\.\w+$", f) and not re.match(r".*\.debian\.tar\.\w+$", f)
@@ -146,33 +175,156 @@ def orig_members(dscdir, files):
             if kind in "lh":
                 name = name.split(" -> " if kind == "l" else " link to ", 1)[0]
             name = name.split("/", 1)[1] if "/" in name else ""
-            # dpkg-source replaces an orig tarball's debian/ with the package's.
-            if not name or kind == "d" or name == "debian" or name.startswith("debian/"):
+            # dpkg-source replaces an orig tarball's debian/ with the package's. A
+            # native tarball's debian/ is the package's own.
+            if not comp and (name == "debian" or name.startswith("debian/")):
+                if m:
+                    debian.append(name)
+                continue
+            if not name or kind == "d":
                 continue
             members[(comp + "/" if comp else "") + name] = kind
-    return members
+    return members, debian
 
 
-def run_trace(root, dsc, out, jobs, nodeps, name, full=False, arch="darwin-arm64", build_type="b", slot=None):
+def tree_state(src):
+    """{path: (type, mode, owner, mtime, link target or sha256)} for the extracted tree SRC,
+    without what rules.mk's clean removes."""
+    control = sudo("cat", os.path.join(src, "debian/control"), capture_output=True, text=True).stdout
+    prune = ["-o", "-regex", r"\./debian/[^/]*\.substvars"]
+    for p in ["debian/build", "debian/files"] + \
+            ["debian/" + p for p in re.findall(r"^Package:\s*(\S+)", control, re.M)]:
+        prune += ["-o", "-path", "./" + p]
+    find = 'cd "$1" && shift && find . -xdev "(" "$@" ")" -prune -o '
+    listing = sudo("sh", "-c", find + '-printf "%y %m %U:%G %T@ %p\\0%l\\0"', "sh", src, *prune[1:],
+                   capture_output=True).stdout.decode("utf-8", "surrogateescape").split("\0")
+    files = sudo("sh", "-c", find + "-type f -print0", "sh", src, *prune[1:], capture_output=True).stdout
+    sums = sudo("sh", "-c", 'cd "$1" && xargs -0 -r sha256sum -z', "sh", src, input=files,
+                capture_output=True).stdout.decode("utf-8", "surrogateescape").split("\0")
+    state = {}
+    for entry, target in zip(listing[0::2], listing[1::2]):
+        kind, mode, owner, mtime, path = entry.split(" ", 4)
+        # debian/'s mtime changes when clean's paths are made in it.
+        state[path] = (kind, mode, owner, "-" if path == "./debian" else mtime, target)
+    hashed = set()
+    for line in sums:
+        if line:
+            digest, path = line.split("  ", 1)
+            state[path] = state[path][:4] + (digest,)
+            hashed.add(path)
+    unhashed = sorted(p for p, s in state.items() if s[0] == "f" and p not in hashed)
+    if unhashed:
+        die("the snapshot of %s has no sha256 for %s" % (src, ", ".join(unhashed[:5])))
+    return state
+
+
+def check_name(what, v):
+    """Names become paths that are removed: one name of letters, digits and ._+-, from a letter or digit."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]*", v):
+        die("%s may have only letters, digits and ._+- and must start with a letter or digit: %r" % (what, v))
+
+
+def fixed_environment(keep=()):
+    """The tool and what it runs see only PATH, TMPDIR and KEEP of the caller's
+    environment, with LC_ALL=C.UTF-8 and HOME=/nonexistent, so no file in a
+    home directory and no variable such as TAR_OPTIONS reaches them."""
+    env = {k: os.environ[k] for k in ("PATH", "TMPDIR") + tuple(keep) if k in os.environ}
+    env.update(LC_ALL="C.UTF-8", HOME="/nonexistent")
+    os.environ.clear()
+    os.environ.update(env)
+
+
+def traversed(path):
+    """Every directory entry the kernel passes through to reach PATH, as a real
+    directory and a name: each link is followed where it is met, so a link in
+    a parent directory, an alias of a directory or a chain of links is listed."""
+    out, cur, hops = [], "/", 0
+    todo = [c for c in os.path.join(os.getcwd(), path).split("/") if c]
+    while todo:
+        c = todo.pop(0)
+        if c == ".":
+            continue
+        if c == "..":
+            cur = os.path.dirname(cur)
+            continue
+        e = os.path.join(cur, c)
+        out.append(e)
+        if os.path.islink(e):
+            hops += 1
+            if hops > 40:
+                die("%s: too many links" % path)
+            t = os.readlink(e)
+            todo = [x for x in t.split("/") if x] + todo
+            if t.startswith("/"):
+                cur = "/"
+        else:
+            cur = e
+    return out
+
+
+def fresh(path):
+    """PATH opened for writing as a new file: an existing file or link there is
+    removed first, so a write never goes through a link."""
+    if os.path.lexists(path):
+        os.unlink(path)
+    return open(path, "w")
+
+
+def within(path, top):
+    """PATH is TOP or under it."""
+    return path == top or top == "/" or path.startswith(top.rstrip("/") + "/")
+
+
+def run_trace(root, dsc, out, jobs, nodeps, name, full=False, arch="darwin-arm64", build_type="b", slot=None, inputs=()):
     src, version, files = dsc_fields(dsc)
     name = name or src
+    check_name("the trace's name", name)
+    for f in files + [os.path.basename(dsc)]:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_~-]*", f):
+            die("the .dsc's name, or a file name it lists, is one pie-trace does not take: %r" % f)
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", arch):
+        die("--arch may have only lower-case letters, digits and -: %r" % arch)
+    dsc_sha256 = hashlib.sha256(open(dsc, "rb").read()).hexdigest()
     inside = "/work/trace-" + name
     # With a slot, the build has a directory of its own on the host, mounted
     # at INSIDE for it alone: builds in other slots run at the same time, at
     # the same path.
-    w = root + inside + ("." + slot if slot else "")
+    w = root + inside + ("@" + slot if slot else "")
+    if os.path.realpath(root) == "/":
+        die("ROOT may not be /")
+    # No symlink may be on the way to the work directory, or rm -rf would follow it.
+    if os.path.realpath(w) != os.path.realpath(root) + inside + ("@" + slot if slot else ""):
+        die("the work directory %s is reached through a symlink" % w)
+    # Nor to the mount point: the host and the chroot would resolve a link there differently.
+    if slot and os.path.realpath(root + inside) != os.path.realpath(root) + inside:
+        die("the mount point %s is reached through a symlink" % (root + inside))
+    # Removing OUT or the work directory may not remove an input, the chroot or a build's work directory.
+    o, wr, rr = os.path.realpath(out), os.path.realpath(w), os.path.realpath(root)
+    for d in (rr, rr + "/work", wr):
+        if within(d, o):
+            die("OUT %s is or holds %s, which removing OUT would remove" % (out, d))
+    if within(o, rr):
+        die("OUT %s is in the chroot %s" % (out, rr))
+    # The .dsc is hashed and copied from where its path leads, with the files it lists beside it.
+    given, dsc = dsc, os.path.realpath(dsc)
+    here = os.path.dirname(dsc)
+    for p in [given, root] + [os.path.join(here, f) for f in files] + list(inputs):
+        for q in traversed(p):
+            for top, what in ((o, "OUT"), (wr, "the work directory")):
+                if within(q, top):
+                    die("%s holds %s, on the way to %s, and removing %s would remove it" % (top, q, p, what))
     bind = (w, inside) if slot else None
     sudo("rm", "-rf", w)
     sudo("mkdir", "-p", w)
-    here = os.path.dirname(os.path.abspath(dsc))
-    sudo("cp", os.path.abspath(dsc), *[os.path.join(here, f) for f in files], w + "/")
-    sh(in_root(root, "cd %s && dpkg-source -q -x %s src >/dev/null" % (inside, os.path.basename(dsc)), bind=bind))
+    sudo("cp", dsc, *[os.path.join(here, f) for f in files], w + "/")
+    sh(in_root(root, "cd %s && dpkg-source -q -x %s src >/dev/null" % (inside, shlex.quote(os.path.basename(dsc))), bind=bind))
+    before = tree_state(w + "/src")
     sudo("find", w + "/src", "-xdev", "-exec", "touch", "-a", "-h", "-d", "@0", "{}", "+")
     if os.path.exists(out):
         shutil.rmtree(out)
     os.makedirs(os.path.join(out, "debs"))
     build = "cd %s/src && %sdpkg-buildpackage %s-%s -us -uc -j%d%s > ../build.log 2>&1" % (
-        inside, "PIE_FULL_SOURCE=1 " if full else "", "" if arch == "host" else "-a %s " % arch, build_type, jobs,
+        inside, "PIE_FULL_SOURCE=1 " if full else "", "" if arch == "host" else "-a %s " % shlex.quote(arch), build_type, jobs,
         " -d" if nodeps else "")
     strace = ["strace", "-f", "-qq", "-y", "-Y", "--seccomp-bpf", "-s", "4096",
               "-e", "trace=open,openat,openat2,creat,stat,lstat,newfstatat,statx,access,faccessat,"
@@ -187,16 +339,27 @@ def run_trace(root, dsc, out, jobs, nodeps, name, full=False, arch="darwin-arm64
         if f.endswith(".deb"):
             shutil.copy(os.path.join(w, f), os.path.join(out, "debs"))
     atimes = {}
-    members = orig_members(here, files)
+    members, orig_debian = orig_members(here, files)
     for path in members:
         try:
             atimes[path] = os.lstat(os.path.join(w, "src", path)).st_atime > 0
         except FileNotFoundError:
             atimes[path] = None
-    json.dump({"root": root, "inside": inside, "dsc": os.path.abspath(dsc), "src": src, "version": version,
-               "rc": rc, "members": members, "atimes": atimes}, open(os.path.join(out, "meta.json"), "w"))
+    # After the access times: the snapshot reads every file.
+    after = tree_state(w + "/src")
+    changes = ["%s %s" % ("+" if p not in before else "-" if p not in after else "~", p[2:] or ".")
+               for p in sorted(set(before) | set(after)) if before.get(p) != after.get(p)]
+    with fresh(os.path.join(out, "tree-changes.txt")) as f:
+        f.write("".join(c + "\n" for c in changes))
+    json.dump({"root": root, "inside": inside, "host": w, "dsc": os.path.abspath(dsc),
+               "dsc_sha256": dsc_sha256, "src": src, "version": version,
+               "rc": rc, "members": members, "orig_debian": orig_debian, "atimes": atimes,
+               "tree_changes": len(changes)},
+              fresh(os.path.join(out, "meta.json")))
     if rc != 0:
         die("the build failed (rc %d); see %s/build.log" % (rc, out))
+    if changes:
+        die("the build changed the source tree (%d paths); see %s/tree-changes.txt" % (len(changes), out))
 
 
 LINE = re.compile(r"^(\d+)<(.*?)> (\w+)\((.*)\) += (-?\d+)(?:<(.*)>)?(?: \(.*\))?$")
@@ -224,8 +387,12 @@ def dep5(pattern):
 
 
 def analyse(out, leave_out=None, maps=(), scope=(), keep=None):
+    if os.path.islink(out) or not os.path.isdir(out):
+        die("%s is not a directory, or is a link" % out)
     meta = json.load(open(os.path.join(out, "meta.json")))
     root, tree = meta["root"].rstrip("/"), meta["inside"] + "/src"
+    # Where the build's tree is on the host: with a slot, not ROOT/INSIDE.
+    host = meta.get("host", root + meta["inside"]) + "/src"
     members = meta["members"]
     copies = []
     for m in maps:
@@ -420,7 +587,12 @@ def analyse(out, leave_out=None, maps=(), scope=(), keep=None):
         if r in members:
             for pid, comm in who:
                 pid_reads[pid].add(r)
-    bulk = {pid for pid, rs in pid_reads.items() if pid_comm.get(pid) in COPY_TOOLS and len(rs) >= 50}
+    # In a tree of fewer than 50 files, a copy of every regular member counts
+    # too when it goes to debian/build/src, rules' copy of the tree.
+    regular = sum(1 for k in members.values() if k not in "lh")
+    rules_copy = tree + "/debian/build/src/"
+    bulk = {pid for pid, rs in pid_reads.items() if pid_comm.get(pid) in COPY_TOOLS and (
+        len(rs) >= 50 or (len(rs) >= regular and writes[pid] and all(p.startswith(rules_copy) for p in writes[pid])))}
     by_name = collections.defaultdict(list)
     for m in members:
         by_name[os.path.basename(m)].append(m)
@@ -432,7 +604,7 @@ def analyse(out, leave_out=None, maps=(), scope=(), keep=None):
             for m in by_name.get(os.path.basename(p), ()):
                 if p.endswith("/" + m) and not p.startswith(tree + "/" + m):
                     roots[p[:-len(m) - 1]] += 1
-    copy_roots = sorted(r for r, n in roots.items() if n >= 50)
+    copy_roots = sorted(r for r, n in roots.items() if n >= 50 or (r + "/" == rules_copy and n >= regular))
 
     state = {}
     via = collections.defaultdict(set)
@@ -476,7 +648,7 @@ def analyse(out, leave_out=None, maps=(), scope=(), keep=None):
         pats = [dep5(l.split("#", 1)[0].strip()) for l in open(keep) if l.split("#", 1)[0].strip()]
         kept |= {m for m in members if any(p.match(m) for p in pats)}
     patched = set()
-    debian = os.path.join(root + tree, "debian", "patches", "series")
+    debian = os.path.join(host, "debian", "patches", "series")
     if os.path.exists(debian):
         for line in open(debian):
             p = line.split("#", 1)[0].split()
@@ -488,8 +660,8 @@ def analyse(out, leave_out=None, maps=(), scope=(), keep=None):
     kept |= patched
     for m, kind in members.items():
         if kind == "l":
-            target = os.path.normpath(os.path.join(os.path.dirname(m), os.readlink(root + tree + "/" + m))) \
-                if os.path.islink(root + tree + "/" + m) else None
+            target = os.path.normpath(os.path.join(os.path.dirname(m), os.readlink(host + "/" + m))) \
+                if os.path.islink(host + "/" + m) else None
             if target in kept:
                 kept.add(m)
     dirs = {os.path.dirname(k) for k in kept}
@@ -508,17 +680,18 @@ def analyse(out, leave_out=None, maps=(), scope=(), keep=None):
                 if state[m] == "read":
                     left_used.append(m)
     atimes = meta["atimes"]
-    atime_only = sorted(m for m in members if atimes.get(m) and m not in kept)
+    # A whole-tree copy reads every file, so access times then tell nothing.
+    atime_only = [] if bulk else sorted(m for m in members if atimes.get(m) and m not in kept)
     outside = sorted(p for p, who in reads.items() if not p.startswith(tree + "/") and not p.startswith(
         ("/proc/", "/dev/", "/sys/", "pipe:", "socket:", "anon_inode:")) and not any(p.startswith(cr + "/") for cr in copy_roots))
 
-    with open(os.path.join(out, "files.tsv"), "w") as f:
+    with fresh(os.path.join(out, "files.tsv")) as f:
         for m in sorted(members):
             f.write("%s\t%s\t%s\t%s\n" % ("kept" if m in kept else "out", state[m], ",".join(sorted(via.get(m, ()))), m))
-    open(os.path.join(out, "kept.txt"), "w").write("".join(k + "\n" for k in sorted(kept)))
-    open(os.path.join(out, "outside.txt"), "w").write("".join(p + "\n" for p in outside))
+    fresh(os.path.join(out, "kept.txt")).write("".join(k + "\n" for k in sorted(kept)))
+    fresh(os.path.join(out, "outside.txt")).write("".join(p + "\n" for p in outside))
     patterns = compress(set(members), kept)
-    open(os.path.join(out, "files-included.txt"), "w").write("".join(p + "\n" for p in patterns))
+    fresh(os.path.join(out, "files-included.txt")).write("".join(p + "\n" for p in patterns))
     counts = collections.Counter(state.values())
     report = [
         "source: %s %s (build rc %d)" % (meta["src"], meta["version"], meta["rc"]),
@@ -527,15 +700,16 @@ def analyse(out, leave_out=None, maps=(), scope=(), keep=None):
         "patched by debian/patches: %d (%d of them never read)" % (len(patched), len(patched - {m for m in members if state[m] == 'read'})),
         "whole-tree copy steps: %d process(es); copy roots: %s" % (len(bulk), ", ".join(copy_roots) or "none"),
         "orig files the build replaced with its own: %d" % len(
-            {p for p in ever_replaced if rel(p) in members or any(p.startswith(b + "/") for b in targets)}),
-        "atime says read but the trace does not (kept out): %d" % len(atime_only),
+            {p for p in ever_replaced if rel(p) in members or p in filecopy or any(p.startswith(b + "/") for b in targets)}),
+        "atime says read but the trace does not (kept out): %s" % (
+            "not checked: a whole-tree copy reads every file" if bulk else len(atime_only)),
         "Files-Included patterns: %d" % len(patterns),
         "left out although the build reads them (--leave-out): %d" % len(left_used),
     ]
     if atime_only:
         report += ["  " + m for m in atime_only[:50]]
-    open(os.path.join(out, "left-out-used.txt"), "w").write("".join(m + "\n" for m in left_used))
-    open(os.path.join(out, "report.txt"), "w").write("\n".join(report) + "\n")
+    fresh(os.path.join(out, "left-out-used.txt")).write("".join(m + "\n" for m in left_used))
+    fresh(os.path.join(out, "report.txt")).write("\n".join(report) + "\n")
     print("\n".join(report))
 
 
@@ -572,7 +746,7 @@ def compress(members, kept):
 
 
 def main():
-    ap = argparse.ArgumentParser(usage=__doc__)
+    ap = argparse.ArgumentParser(usage=__doc__[len("usage: "):])
     ap.add_argument("--chroot")
     ap.add_argument("--analyse", action="store_true")
     ap.add_argument("dsc", nargs="?")
@@ -591,6 +765,7 @@ def main():
     ap.add_argument("--map", action="append", default=[])
     ap.add_argument("--scope", action="append", default=[])
     a = ap.parse_args()
+    fixed_environment(("PIE_UNSHARE",))
     out = os.path.abspath(a.out)
     if not a.analyse:
         if a.unshare:
@@ -598,7 +773,11 @@ def main():
             UNSHARE = True
         if not (a.chroot and a.dsc):
             die("need --chroot ROOT DSC OUT")
-        run_trace(a.chroot, a.dsc, out, a.jobs, a.nodeps, a.name, a.full, a.arch, a.build, a.slot)
+        for what, v in ("--name", a.name), ("--slot", a.slot):
+            if v is not None:
+                check_name(what, v)
+        run_trace(a.chroot, a.dsc, out, a.jobs, a.nodeps, a.name, a.full, a.arch, a.build, a.slot,
+                  [p for p in (a.leave_out, a.keep) if p])
     analyse(out, a.leave_out and os.path.abspath(a.leave_out), a.map, a.scope, a.keep and os.path.abspath(a.keep))
 
 

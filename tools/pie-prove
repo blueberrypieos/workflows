@@ -1,34 +1,170 @@
-#!/bin/bash
+#!/bin/bash -p
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2026 The Blueberry Pie OS Authors
 # usage: pie-prove REPO NAME [CHROOT] [JOBS]
+# NAME has only letters, digits and ._+- and starts with a letter or digit.
+# CHROOT is by default /srv/claude-basic-ports, and JOBS 8.
 # Builds REPO's HEAD as a full and as a reduced source package, builds the
 # binary packages of each from its .dsc under pie-trace in CHROOT, compares
 # them (pie-verify compare) and checks the reduced one (pie-verify check).
 # debian/pie-leave-out, if there, is passed to pie-trace, and the installed
 # paths of those files are the only removals pie-verify compare accepts.
-# Writes OUT/NAME-{F,R,tF,tR} and OUT/NAME-prove.txt (OUT: $PIE_OUT, by
-# default ./pie-out).
+# debian/pie-keep, if there, names files the source package keeps although
+# the trace cannot see that the build needs them. pie-prove passes the file
+# to pie-trace --keep.
+# REPO may have no changes that are not committed, and no files marked
+# assume-unchanged or skip-worktree. pie-prove and pie-source read debian/
+# only from HEAD. NAME-prove.txt may not be a link or anything but a file.
+# NAME-F, -R, -tF and -tR may not be links. Check-only and resume runs
+# write NAME-tF.txt, NAME-tR.txt, NAME-allow-missing.txt and the analysis
+# files anew, removing the old ones first. The proof fails unless both builds
+# left their source tree unchanged and the reduced orig holds exactly the
+# files the full build's trace keeps.
+# Writes in OUT: NAME-F and NAME-R, the source packages, with NAME-F.log and
+# NAME-R.log; NAME-F/NOT-FOR-UPLOAD; NAME-tF and NAME-tR, the traces, with
+# NAME-tF.txt and NAME-tR.txt; NAME-allow-missing.txt; NAME-commit.txt, the
+# commit the source packages are made from; and NAME-prove.txt, the report.
+# OUT is $PIE_OUT, by default ./pie-out. A run removes NAME-prove.txt first.
+# The traces build in CHROOT/work/trace-NAME@F and trace-NAME@R, which they
+# remove first, and mount them on CHROOT/work/trace-NAME, which they leave.
+# If the reduced build fails, pie-prove stops the full build's pie-trace. A
+# report that passes ends with "proof: passed".
+# A run that makes source packages, or takes them from PIE_PROVE_SOURCES,
+# first removes NAME-F, NAME-R, their logs, NAME-commit.txt, the traces
+# NAME-tF and NAME-tR, NAME-tF.txt, NAME-tR.txt and NAME-allow-missing.txt.
+# None of them may be on the way to REPO, CHROOT, the tools or an imported
+# source package, and neither may CHROOT/work/trace-NAME@F or @R. OUT may not
+# be /, and CHROOT needs dpkg-buildpackage. Start pie-prove as a command, by
+# its #! line: started as "bash pie-prove", exported functions reach it. pie-prove runs lintian on the
+# reduced .dsc for the report, and fails if lintian fails. git takes no
+# replace refs. pie-prove and what it runs see only PATH, TMPDIR, PIE_OUT,
+# PIE_UNSHARE and the variables below of the caller's environment, with
+# LC_ALL=C.UTF-8 and HOME=/nonexistent. PIE_UNSHARE=1 is passed to pie-trace.
 set -euo pipefail
-repo=$(realpath "$1") name=$2 root=${3:-/srv/claude-basic-ports} jobs=${4:-8}
-tools=$(dirname "$(realpath "$0")")
+own="PIE_OUT PIE_TRACE_ARGS PIE_PROVE_SOURCES PIE_PROVE_CHECK_ONLY PIE_PROVE_RESUME PIE_UNSHARE"
+fixed=yes
+for v in $(compgen -e); do
+	case " PATH TMPDIR LC_ALL HOME PWD SHLVL OLDPWD _ PIE_FIXED $own " in *" $v "*) ;; *) fixed=no ;; esac
+done
+[ "${LC_ALL:-}" = C.UTF-8 ] && [ "${HOME:-}" = /nonexistent ] && [ -z "$(declare -Fx)" ] || fixed=no
+if [ $fixed = no ]; then
+	[ -z "${PIE_FIXED:-}" ] || { echo "pie-prove: the environment is still not fixed" >&2; exit 1; }
+	keep=()
+	for v in PATH TMPDIR $own; do [ -z "${!v+x}" ] || keep+=("$v=${!v}"); done
+	exec env -i "${keep[@]}" LC_ALL=C.UTF-8 HOME=/nonexistent PIE_FIXED=1 bash -p "$(realpath "${BASH_SOURCE[0]}")" "$@"
+fi
+if [ $# -lt 2 ]; then sed -n '4,/^trace_args=/{/^#/s/^# \{0,1\}//p}' "${BASH_SOURCE[0]}" >&2; exit 2; fi
+name=$2 root=${3:-/srv/claude-basic-ports} jobs=${4:-8}
 out=$(realpath -m "${PIE_OUT:-pie-out}")
-# PIE_TRACE_ARGS: more pie-trace options for both builds (--map, --scope,
-# --arch, --build). PIE_PROVE_SOURCES=PREFIX: use the source packages in
-# PREFIX-F and PREFIX-R (another proof's, of the same commit).
+case $name in ''|[!A-Za-z0-9]*|*[!A-Za-z0-9.+_-]*) echo "pie-prove: NAME may have only letters, digits and ._+- and must start with a letter or digit: $name" >&2; exit 1 ;; esac
+[ "$out" != / ] || { echo "pie-prove: OUT may not be /" >&2; exit 1; }
+report=$out/$name-prove.txt
+if [ -L "$report" ] || { [ -e "$report" ] && [ ! -f "$report" ]; }; then
+	echo "pie-prove: $report is not a file" >&2
+	exit 1
+fi
+rm -f "$report"
+repo=$(realpath "$1")
+tools=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+[ -x "$root/usr/bin/dpkg-buildpackage" ] || { echo "pie-prove: CHROOT has no dpkg-buildpackage: $root" >&2; exit 1; }
+export GIT_NO_REPLACE_OBJECTS=1
+# PIE_TRACE_ARGS: more pie-trace options for both builds, only -d, --map,
+# --scope, --arch and --build. The report's first line names them.
+# PIE_PROVE_SOURCES=PREFIX: use the source packages in PREFIX-F and
+# PREFIX-R, another proof's. Its PREFIX-commit.txt must name HEAD, as must
+# NAME-commit.txt of an earlier proof that is resumed or checked.
 # PIE_PROVE_CHECK_ONLY=1: keep both builds' traces, and redo only the
-# analysis, comparison and checks.
+# analysis, comparison and checks. Both traces must be there.
 # PIE_PROVE_RESUME=1: keep NAME-F, NAME-R and NAME-tF if the full build's
 # trace is there, and go on from the reduced build.
+set -f
 trace_args=(${PIE_TRACE_ARGS:-})
+set +f
+i=0
+while [ $i -lt ${#trace_args[@]} ]; do
+	case ${trace_args[$i]} in
+	-d|--map=?*|--scope=?*|--arch=?*|--build=?*) i=$((i + 1)) ;;
+	--map|--scope|--arch|--build)
+		[ $((i + 1)) -lt ${#trace_args[@]} ] || { echo "pie-prove: PIE_TRACE_ARGS: ${trace_args[$i]} needs a value" >&2; exit 1; }
+		i=$((i + 2)) ;;
+	*) echo "pie-prove: PIE_TRACE_ARGS may have only -d, --map, --scope, --arch and --build: ${trace_args[$i]}" >&2; exit 1 ;;
+	esac
+done
+# The proof is of HEAD. The tools read only HEAD; the working tree must match it too.
+if ! git -C "$repo" -c core.fsmonitor=false diff --quiet HEAD; then
+	echo "pie-prove: $repo has changes that are not committed" >&2
+	exit 1
+fi
+flags=$(git -C "$repo" -c core.fsmonitor=false ls-files -v) || { echo "pie-prove: git ls-files failed in $repo" >&2; exit 1; }
+nl=$'\n'
+if [[ "$nl$flags" == *"$nl"[a-zS]" "* ]]; then
+	echo "pie-prove: $repo has files marked assume-unchanged or skip-worktree, so git cannot see their changes" >&2
+	exit 1
+fi
+# What the run removes or writes may not hold REPO, CHROOT, the tools, an
+# imported source package or anything on the way to one, links followed.
+removed=("$out/$name-F" "$out/$name-R" "$out/$name-tF" "$out/$name-tR" "$out/$name-tF.txt" "$out/$name-tR.txt"
+	"$out/$name-allow-missing.txt" "$out/$name-commit.txt" "$out/$name-prove.txt" "$out/$name-F.log" "$out/$name-R.log"
+	"$root/work/trace-$name@F" "$root/work/trace-$name@R")
+kept=("$1" "$repo" "$root" "$tools")
+[ -z "${PIE_PROVE_SOURCES:-}" ] || kept+=("$PIE_PROVE_SOURCES-F" "$PIE_PROVE_SOURCES-R" "$PIE_PROVE_SOURCES-commit.txt")
+python3 -I - "${removed[@]}" -- "${kept[@]}" <<'EOF' || exit 1
+import os, sys
+a = sys.argv[1:]
+removed, kept = [os.path.realpath(p) for p in a[:a.index("--")]], a[a.index("--") + 1:]
+def traversed(path):
+    out, cur, todo, hops = [], "/", [c for c in os.path.join(os.getcwd(), path).split("/") if c], 0
+    while todo:
+        c = todo.pop(0)
+        if c == ".":
+            continue
+        if c == "..":
+            cur = os.path.dirname(cur)
+            continue
+        e = os.path.join(cur, c)
+        out.append(e)
+        if os.path.islink(e) and hops < 40:
+            hops += 1
+            t = os.readlink(e)
+            todo = [x for x in t.split("/") if x] + todo
+            cur = "/" if t.startswith("/") else cur
+        else:
+            cur = e
+    return out
+for k in kept:
+    for e in traversed(k):
+        for r in removed:
+            if e == r or e.startswith(r + "/"):
+                sys.exit("pie-prove: %s is on the way to %s, and the run removes or writes %s" % (e, k, r))
+EOF
+head=$(git -C "$repo" rev-parse HEAD)
+for d in "$out/$name-F" "$out/$name-R" "$out/$name-tF" "$out/$name-tR"; do
+	[ ! -L "$d" ] || { echo "pie-prove: $d is a link" >&2; exit 1; }
+done
 mkdir -p "$out"
-src=$(dpkg-parsechangelog -l "$repo/debian/changelog" -SSource)
-ver=$(dpkg-parsechangelog -l "$repo/debian/changelog" -SVersion | sed 's/^[0-9]*://')
+# debian/ is read from HEAD, never from the working tree.
+hd=$(mktemp -d)
+trap 'rm -rf "$hd"' EXIT
+for f in changelog pie-leave-out pie-keep; do
+	if git -C "$repo" -c core.fsmonitor=false cat-file -e "HEAD:debian/$f" 2> /dev/null; then
+		git -C "$repo" cat-file blob "HEAD:debian/$f" > "$hd/$f"
+	fi
+done
+[ -f "$hd/changelog" ] || { echo "pie-prove: HEAD has no debian/changelog" >&2; exit 1; }
+src=$(dpkg-parsechangelog -l "$hd/changelog" -SSource)
+ver=$(dpkg-parsechangelog -l "$hd/changelog" -SVersion | sed 's/^[0-9]*://')
 leave=() allow=()
-if [ -f "$repo/debian/pie-leave-out" ]; then
-	leave=(--leave-out "$repo/debian/pie-leave-out")
+if [ -f "$hd/pie-leave-out" ]; then
+	leave=(--leave-out "$hd/pie-leave-out")
+fi
+if [ -f "$hd/pie-keep" ]; then
+	trace_args+=(--keep "$hd/pie-keep")
 fi
 resume= checkonly=
+if [ -n "${PIE_PROVE_CHECK_ONLY:-}" ] && ! { [ -f "$out/$name-tF/meta.json" ] && [ -f "$out/$name-tR/meta.json" ]; }; then
+	echo "pie-prove: PIE_PROVE_CHECK_ONLY needs both traces, $out/$name-tF and $out/$name-tR" >&2
+	exit 1
+fi
 if [ -n "${PIE_PROVE_CHECK_ONLY:-}" ] && [ -f "$out/$name-tF/meta.json" ] && [ -f "$out/$name-tR/meta.json" ]; then
 	# Both builds are traced: only the analysis, comparison and checks again.
 	resume=1 checkonly=1
@@ -36,34 +172,77 @@ elif [ -n "${PIE_PROVE_RESUME:-}" ] && [ -f "$out/$name-tF/meta.json" ]; then
 	# Go on from a proof that stopped after the full build's trace.
 	resume=1
 elif [ -n "${PIE_PROVE_SOURCES:-}" ]; then
-	rm -rf "$out/$name-F" "$out/$name-R"
-	# Another proof's source packages of the same commit (PREFIX-F, PREFIX-R).
-	cp -a "$PIE_PROVE_SOURCES-F" "$out/$name-F"
-	cp -a "$PIE_PROVE_SOURCES-R" "$out/$name-R"
+	# Another proof's source packages, which must be of HEAD.
+	# Nothing it imports may be in, or hold, what the run removes or writes.
+	for s0 in "$PIE_PROVE_SOURCES-F" "$PIE_PROVE_SOURCES-R" "$PIE_PROVE_SOURCES-commit.txt"; do
+		# Both the entry itself and its target.
+		for s in "$(realpath -m "$(dirname "$s0")")/$(basename "$s0")" "$(realpath -m "$s0")"; do
+			for d in "$out/$name-F" "$out/$name-R" "$out/$name-tF" "$out/$name-tR" "$out/$name-tF.txt" "$out/$name-tR.txt" \
+				"$out/$name-allow-missing.txt" "$out/$name-commit.txt" "$out/$name-prove.txt" \
+				"$out/$name-F.log" "$out/$name-R.log"; do
+				case "$s/" in "$d"/*) echo "pie-prove: $s is in $d, which the run removes or writes" >&2; exit 1 ;; esac
+				case "$d/" in "$s"/*) echo "pie-prove: $s holds $d, which the run removes or writes" >&2; exit 1 ;; esac
+			done
+		done
+	done
+	if [ "$(cat "$PIE_PROVE_SOURCES-commit.txt" 2>/dev/null)" != "$head" ]; then
+		echo "pie-prove: the source packages in $PIE_PROVE_SOURCES-F and -R are not of HEAD" >&2
+		exit 1
+	fi
+	rm -rf "$out/$name-F" "$out/$name-R" "$out/$name-F.log" "$out/$name-R.log" "$out/$name-commit.txt" \
+		"$out/$name-tF" "$out/$name-tR" "$out/$name-tF.txt" "$out/$name-tR.txt" "$out/$name-allow-missing.txt"
+	mkdir "$out/$name-F" "$out/$name-R"
+	cp -a "$PIE_PROVE_SOURCES-F/." "$out/$name-F/"
+	cp -a "$PIE_PROVE_SOURCES-R/." "$out/$name-R/"
+	cp "$PIE_PROVE_SOURCES-commit.txt" "$out/$name-commit.txt"
 else
-	rm -rf "$out/$name-F" "$out/$name-R"
-	PIE_QUIET=1 "$tools/pie-source" source --full -C "$repo" -o "$out/$name-F" >/dev/null 2>"$out/$name-F.log"
-	PIE_QUIET=1 "$tools/pie-source" source -C "$repo" -o "$out/$name-R" >/dev/null 2>"$out/$name-R.log"
+	# Old traces go first, so that none can pass for a trace of the new sources.
+	rm -rf "$out/$name-F" "$out/$name-R" "$out/$name-F.log" "$out/$name-R.log" "$out/$name-commit.txt" \
+		"$out/$name-tF" "$out/$name-tR" "$out/$name-tF.txt" "$out/$name-tR.txt" "$out/$name-allow-missing.txt"
+	PIE_QUIET=1 "$tools/pie-source" source --full -C "$repo" -o "$out/$name-F" >/dev/null 2>"$out/$name-F.log" ||
+		{ echo "pie-prove: pie-source failed; see $out/$name-F.log" >&2; exit 1; }
+	# The full tree has the orig name of the real one: it is only for the analysis.
+	echo "The full upstream tree, for pie-trace only. Never upload it: $name-R holds the source package." > "$out/$name-F/NOT-FOR-UPLOAD"
+	PIE_QUIET=1 "$tools/pie-source" source -C "$repo" -o "$out/$name-R" >/dev/null 2>"$out/$name-R.log" ||
+		{ echo "pie-prove: pie-source failed; see $out/$name-R.log" >&2; exit 1; }
+	if [ "$(git -C "$repo" rev-parse HEAD)" != "$head" ]; then
+		echo "pie-prove: HEAD moved while the source packages were made" >&2
+		exit 1
+	fi
+	echo "$head" > "$out/$name-commit.txt"
+fi
+if [ -n "$resume" ] && [ "$(cat "$out/$name-commit.txt" 2>/dev/null)" != "$head" ]; then
+	echo "pie-prove: the earlier proof in $out is not of HEAD" >&2
+	exit 1
 fi
 # The full and the reduced build run at once, each in a slot of its own
 # (the same path in the chroot).
 fpid=
 if [ -n "$checkonly" ]; then
+	rm -f "$out/$name-tR.txt"
 	"$tools/pie-trace" --analyse "$out/$name-tR" "${trace_args[@]}" > "$out/$name-tR.txt"
 elif [ -z "$resume" ]; then
+	rm -f "$out/$name-tF.txt"
 	"$tools/pie-trace" --chroot "$root" "$out/$name-F/${src}_$ver.dsc" "$out/$name-tF" -j "$jobs" --name "$name" --full "${leave[@]}" "${trace_args[@]}" --slot F > "$out/$name-tF.txt" &
 	fpid=$!
 fi
+[ -n "$checkonly" ] || rm -f "$out/$name-tR.txt"
 if [ -z "$checkonly" ] && ! "$tools/pie-trace" --chroot "$root" "$out/$name-R/${src}_$ver.dsc" "$out/$name-tR" -j "$jobs" --name "$name" "${trace_args[@]}" --slot R > "$out/$name-tR.txt"; then
 	[ -z "$fpid" ] || kill "$fpid"
 	exit 1
 fi
 [ -z "$fpid" ] || wait "$fpid"
+if [ -n "$resume" ]; then
+	# The full build's trace is an earlier run's: analyse it with the current options.
+	rm -f "$out/$name-tF.txt"
+	"$tools/pie-trace" --analyse "$out/$name-tF" "${leave[@]}" "${trace_args[@]}" > "$out/$name-tF.txt"
+fi
 if [ -s "$out/$name-tF/left-out-used.txt" ]; then
 	# With the same maps and scopes as the trace, or reads through copies
 	# would look like new ones.
 	"$tools/pie-trace" --analyse "$out/$name-tF" "${leave[@]}" "${trace_args[@]}" >/dev/null
-	python3 - "$out/$name-tF" > "$out/$name-allow-missing.txt" <<'EOF'
+	rm -f "$out/$name-allow-missing.txt"
+	python3 -I - "$out/$name-tF" > "$out/$name-allow-missing.txt" <<'EOF'
 import os, sys, subprocess
 # Where each left-out file was installed: the copies the trace saw.
 out = sys.argv[1]
@@ -77,18 +256,51 @@ for deb in os.listdir(debs):
         p = p.lstrip("./")
         # The installed copy ends with the file's directory and name
         # (man3/cabs.3, csmapper/APPLE/...), wherever it was installed.
-        if any(p.endswith("/" + "/".join(l.split("/")[-2:])) for l in left):
+        # A top-level file such as README is not matched. Its name alone would
+        # match installed files from elsewhere.
+        if any("/" in l and p.endswith("/" + "/".join(l.split("/")[-2:])) for l in left):
             paths.add(p)
 print("\n".join(sorted(paths)))
 EOF
 	allow=(--allow-missing "$out/$name-allow-missing.txt")
 fi
 {
-	echo "== $src $ver"
-	sed -n '2,3p;8p' "$out/$name-tF.txt"
+	echo "== $src $ver, commit $(cat "$out/$name-commit.txt" 2>/dev/null || echo unknown)${PIE_TRACE_ARGS:+, PIE_TRACE_ARGS: $PIE_TRACE_ARGS}"
+	sed -n '2,3p;5p;8,9p' "$out/$name-tF.txt"
+	python3 -I - "$out/$name-tF" "$out/$name-tR" "$out/$name-F/${src}_$ver.dsc" "$out/$name-R/${src}_$ver.dsc" <<'EOF'
+import hashlib, json, os, sys
+bad = 0
+for kind, out, dsc in zip(("full", "reduced"), sys.argv[1:3], sys.argv[3:5]):
+    meta = json.load(open(os.path.join(out, "meta.json")))
+    if meta.get("dsc_sha256") != hashlib.sha256(open(dsc, "rb").read()).hexdigest():
+        print("source package: the %s build's trace is not of %s" % (kind, os.path.basename(dsc)))
+        bad += 1
+    if meta.get("rc") != 0:
+        print("build: the %s build FAILED with exit status %s; see %s" % (kind, meta.get("rc"), os.path.join(out, "build.log")))
+    n = meta.get("tree_changes")
+    print("source tree: the %s build %s" % (kind, "was not checked" if n is None else
+          "left it unchanged" if n == 0 else "changed %d paths" % n))
+    bad += n != 0 or meta.get("rc") != 0
+full, reduced = sys.argv[1:3]
+kept = {l.rstrip("\n") for l in open(os.path.join(full, "kept.txt")) if l.strip()}
+orig = set(json.load(open(os.path.join(reduced, "meta.json")))["members"])
+for p in json.load(open(os.path.join(reduced, "meta.json"))).get("orig_debian", ["(the trace did not record them)"]):
+    print("source package: the reduced orig has %s, which dpkg-source replaces with the package's debian/" % p)
+    bad += 1
+for what, paths in (("kept by the full build's trace but not in the reduced orig", kept - orig),
+                    ("in the reduced orig but not kept by the full build's trace", orig - kept)):
+    for p in sorted(paths):
+        print("source package: %s: %s" % (what, p))
+    bad += len(paths)
+if kept == orig:
+    print("source package: the reduced orig holds exactly the %d files the trace keeps" % len(orig))
+sys.exit(1 if bad else 0)
+EOF
 	"$tools/pie-verify" compare "$out/$name-tF" "$out/$name-tR" "${allow[@]}"
 	"$tools/pie-verify" check "$out/$name-R/${src}_$ver.dsc" --debs "$out/$name-tR/debs" --chroot "$root" \
 		--full-dsc "$out/$name-F/${src}_$ver.dsc"
 	echo "lintian:"
-	lintian --tag-display-limit 0 "$out/$name-R/${src}_$ver.dsc" || true
+	lintian --no-cfg -I --fail-on none --tag-display-limit 0 "$out/$name-R/${src}_$ver.dsc" ||
+		{ echo "pie-prove: lintian FAILED"; exit 1; }
+	echo "proof: passed"
 } 2>&1 | tee "$out/$name-prove.txt"

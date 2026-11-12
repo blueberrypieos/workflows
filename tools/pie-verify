@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2026 The Blueberry Pie OS Authors
 """usage: pie-verify compare FULL REDUCED [--allow-missing FILE]
@@ -6,25 +6,42 @@
 
 compare  FULL and REDUCED are pie-trace outputs for the same packaging
          commit, built from the full and the reduced source package. Their
-         debs must be byte-identical; the reduced build may read no file
-         the full build did not, inside or outside the source tree. With
-         --allow-missing (installed paths, one per line, DEP-5 globs), a deb
-         may instead differ only by lacking those files.
+         debs must be byte-identical. The reduced build may read no file the
+         full build did not, inside or outside the source tree. FILE of
+         --allow-missing lists installed paths or DEP-5 globs, one per line.
+         With it, a deb may instead lack those files, and a directory that
+         held only them. Every other member then has the same tar header
+         and contents. The header includes the mtime, the device numbers and
+         the extended headers. The control archive is the same, apart from
+         Installed-Size and those files' md5sums lines. No archive may have
+         a name twice, or a hard link that does not name a regular file
+         before it, identical debs included. The reads outside the tree are
+         those pie-trace lists in outside.txt. They count everywhere but
+         /tmp, which is each build's own, /var/tmp, /run, pipes, sockets,
+         the build's own work directory and pie-source-guard.
 check    Checks a source package: lintian's copyright tags, pie-copyright
          check and lrc on the extracted tree, the restricted-text markers in
-         the source and the debs, and files for other architectures. With
+         the source and the debs, and files for other architectures. The
+         report shows debian/lrc.config's lines. With
          --full-dsc and --chroot it also looks for copies of the left-out
          files among the files installed in the build chroot. A copy is an
          error only if the build opened it (DIR/../outside.txt, when DIR is
          a pie-trace output's debs) and no Build-Depends package, or a package
-         one depends on, installs it.
+         one depends on, installs it. lintian runs with -I. Of its info
+         tags, only an unused licence paragraph is an error. Overridden tags
+         are notes. A lintian, pie-copyright or lrc that fails is an error.
+pie-verify and what it runs see only PATH and TMPDIR of the caller's
+environment, with LC_ALL=C.UTF-8 and HOME=/nonexistent.
 """
 import hashlib
+import io
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
@@ -32,37 +49,74 @@ MARKERS = [r"Internal Use License", r"excludes the right to re-distribute", r"Wi
            r"agreement entered into by Arm", r"W3C\S* (?:XML )?(?:Conformance )?Test Suite"]
 FOREIGN = re.compile(r"(^|/)(ppc|ppc64|powerpc|i386|i486|i686|x86_64|amd64|i860|hppa|sparc|sparc64|m68k|m88k|"
                      r"nrw|mips|mips64|alpha|ia64|riscv)(/|$|[._-])", re.I)
-TMP = re.compile(r"^/tmp/|^/work/|^/var/tmp/|^/run/|^pipe:|^socket:|^anon_inode:")
+TMP = re.compile(r"^/tmp/|^/var/tmp/|^/run/|^pipe:|^socket:|^anon_inode:")
 
 
 def sh(cmd, **kw):
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw).stdout
 
 
-def payload_diff(a, b, allowed):
-    """Files that differ between two debs' contents, apart from allowed removals."""
-    tmp = tempfile.mkdtemp(prefix="pie-cmp-")
-    try:
-        for deb, d in ((a, "a"), (b, "b")):
-            sh(["dpkg-deb", "-x", deb, os.path.join(tmp, d)])
-        def listing(root):
-            out = {}
-            for d, dirs, fs in os.walk(root):
-                for f in fs + [x for x in dirs if os.path.islink(os.path.join(d, x))]:
-                    p = os.path.join(d, f)
-                    r = os.path.relpath(p, root)
-                    out[r] = ("link", os.readlink(p)) if os.path.islink(p) else ("file", open(p, "rb").read())
-            return out
-        la, lb = listing(os.path.join(tmp, "a")), listing(os.path.join(tmp, "b"))
-        bad, gone = [], []
-        for r in sorted(set(la) | set(lb)):
-            if r in la and r not in lb and any(p.match(r) for p in allowed):
-                gone.append(r)
-            elif la.get(r) != lb.get(r):
-                bad.append(r)
-        return bad, gone
-    finally:
-        shutil.rmtree(tmp)
+def fixed_environment(keep=()):
+    """The tool and what it runs see only PATH, TMPDIR and KEEP of the caller's
+    environment, with LC_ALL=C.UTF-8 and HOME=/nonexistent, so no file in a
+    home directory and no variable such as TAR_OPTIONS reaches them."""
+    env = {k: os.environ[k] for k in ("PATH", "TMPDIR") + tuple(keep) if k in os.environ}
+    env.update(LC_ALL="C.UTF-8", HOME="/nonexistent")
+    os.environ.clear()
+    os.environ.update(env)
+
+
+def deb_members(deb, part):
+    """{path: (type, mode, uid, gid, uname, gname, link target, mtime, device
+    numbers, extended headers, contents)} of the data or control archive of
+    DEB. A name may appear only once, and a hard link must name a regular
+    file that comes before it."""
+    data = subprocess.run(["dpkg-deb", "--fsys-tarfile" if part == "data" else "--ctrl-tarfile", deb],
+                          check=True, capture_output=True).stdout
+    out = {}
+    norm = lambda n: (n[2:] if n.startswith("./") else n).rstrip("/") or "."
+    with tarfile.open(fileobj=io.BytesIO(data)) as t:
+        for m in t:
+            name = norm(m.name)
+            if name in out:
+                raise ValueError("%s has %s twice in its %s archive" % (os.path.basename(deb), name, part))
+            if m.islnk() and (norm(m.linkname) not in out or out[norm(m.linkname)][0] not in (tarfile.REGTYPE, tarfile.AREGTYPE)):
+                raise ValueError("%s: %s is a hard link to %s, which is not a regular file before it in its %s archive"
+                                 % (os.path.basename(deb), name, m.linkname, part))
+            body = t.extractfile(m).read() if m.isfile() else None
+            out[name] = (m.type, m.mode, m.uid, m.gid, m.uname, m.gname, m.linkname, m.mtime, m.devmajor, m.devminor,
+                         tuple(sorted(m.pax_headers.items())), body)
+    return out
+
+
+def deb_diff(a, b, allowed):
+    """The members of the debs A and B that differ, apart from allowed removals,
+    and those removals. A directory may go only with an allowed removal in it."""
+    da, db = deb_members(a, "data"), deb_members(b, "data")
+    gone = [r for r in da if r not in db and da[r][0] != tarfile.DIRTYPE and any(p.match(r) for p in allowed)]
+    bad = []
+    for r in sorted(set(da) | set(db)):
+        if r in gone:
+            continue
+        if r in da and r not in db and da[r][0] == tarfile.DIRTYPE:
+            under = [x for x in da if x.startswith(r + "/")]
+            if any(x in gone for x in under) and \
+                    all(x in gone or (da[x][0] == tarfile.DIRTYPE and x not in db) for x in under):
+                continue
+        if da.get(r) != db.get(r):
+            bad.append(r)
+    ca, cb = deb_members(a, "control"), deb_members(b, "control")
+    for r in sorted(set(ca) | set(cb)):
+        x, y = ca.get(r), cb.get(r)
+        if x and y and r == "control":
+            x = x[:-1] + (re.sub(rb"^Installed-Size:.*\n", b"", x[-1], flags=re.M),)
+            y = y[:-1] + (re.sub(rb"^Installed-Size:.*\n", b"", y[-1], flags=re.M),)
+        elif x and y and r == "md5sums":
+            kept = [l for l in x[-1].splitlines(True) if l.split(None, 1)[-1].strip().decode() not in gone]
+            x = x[:-1] + (b"".join(kept),)
+        if x != y:
+            bad.append("DEBIAN/" + r)
+    return bad, gone
 
 
 ALIASES = {"expat": "mit", "bsd-2-clause-netbsd": "bsd-2-clause-netbsd", "bsl": "bsl-1.0",
@@ -131,10 +185,25 @@ def compare(full, reduced, allow=None):
     if fdebs != rdebs:
         errors.append("different debs: %s vs %s" % (fdebs, rdebs))
     for d in sorted(set(fdebs) & set(rdebs)):
-        if open(os.path.join(fd, d), "rb").read() == open(os.path.join(rd, d), "rb").read():
+        same = open(os.path.join(fd, d), "rb").read() == open(os.path.join(rd, d), "rb").read()
+        try:
+            for deb in [os.path.join(fd, d)] + ([] if same else [os.path.join(rd, d)]):
+                deb_members(deb, "data")
+                deb_members(deb, "control")
+        except ValueError as e:
+            errors.append(str(e))
+            continue
+        if same:
             print("%s: identical" % d)
             continue
-        bad, gone = payload_diff(os.path.join(fd, d), os.path.join(rd, d), allowed)
+        if not allowed:
+            errors.append("%s differs, and no removal is allowed" % d)
+            continue
+        try:
+            bad, gone = deb_diff(os.path.join(fd, d), os.path.join(rd, d), allowed)
+        except ValueError as e:
+            errors.append(str(e))
+            continue
         if bad:
             errors.append("%s differs: %s" % (d, bad[:20]))
         else:
@@ -154,8 +223,12 @@ def compare(full, reduced, allow=None):
         errors.append("the reduced build reads source files the full build did not: %s" % sorted(extra)[:20])
 
     def outside(out):
-        return {p.rstrip("\n") for p in open(os.path.join(out, "outside.txt"))
-                if not TMP.match(p) and os.path.basename(p.rstrip("\n")) != "pie-source-guard"}
+        # Only the build's own work directory is left out: a read of another
+        # slot's tree or an old trace's under /work counts.
+        own = json.load(open(os.path.join(out, "meta.json")))["inside"].rstrip("/")
+        return {p for p in (l.rstrip("\n") for l in open(os.path.join(out, "outside.txt")))
+                if not TMP.match(p) and p != own and not p.startswith(own + "/")
+                and os.path.basename(p) != "pie-source-guard"}
 
     fo, ro = outside(full), outside(reduced)
     if ro - fo:
@@ -210,32 +283,58 @@ def check(dsc, debs, chroot, full_dsc):
                 parts = line.split(None, 2)
                 if len(parts) >= 3 and parts[0] == "foreign-arch":
                     allowed.append(parts[1])
-        lint = subprocess.run(["lintian", "--no-tag-display-limit", "--suppress-tags", "changelog-distribution-does-not-match-changes-file", dsc],
-                              capture_output=True, text=True).stdout
+        res = subprocess.run(["lintian", "--no-cfg", "-I", "--show-overrides", "--fail-on", "none",
+                              "--tag-display-limit", "0", "--suppress-tags",
+                              "changelog-distribution-does-not-match-changes-file", dsc],
+                             capture_output=True, text=True)
+        lint = res.stdout
+        if res.returncode:
+            errors.append("lintian FAILED with exit %d: %s" % (res.returncode, " ".join(res.stderr.split())[:300]))
         gen_file = os.path.join(tree, "debian", "pie-generated")
         generated = [l.split("#", 1)[0].strip() for l in open(gen_file) if l.split("#", 1)[0].strip()] \
             if os.path.exists(gen_file) else []
         for line in lint.splitlines():
+            # Only tag lines: an override's comment comes on N: lines.
+            if not re.match(r"[EWIPXO]: ", line):
+                continue
             # A paragraph for generated files names paths the source package lacks.
             if generated and re.search(r"(superfluous-file-pattern|wildcard-matches-nothing)", line) \
                     and any(g in line for g in generated):
                 notes.append("lintian: " + line)
                 continue
             if re.search(r"copyright|dep5|excluded|repackaged|license|licence", line, re.I):
-                errors.append("lintian: " + line)
+                # Of the info tags, only an unused licence paragraph is an error; overridden tags are notes.
+                if line.startswith("O: ") or \
+                        line.startswith("I: ") and "unused-license-paragraph-in-dep5-copyright" not in line:
+                    notes.append("lintian: " + line)
+                else:
+                    errors.append("lintian: " + line)
         res = subprocess.run([os.path.join(TOOLS, "pie-copyright"), "check", os.path.join(tree, "debian", "copyright"),
                               tree], capture_output=True, text=True)
         (errors if res.returncode else notes).extend(("pie-copyright: " + l) for l in res.stdout.splitlines())
+        if res.returncode and not res.stdout.strip():
+            errors.append("pie-copyright FAILED with exit %d: %s"
+                          % (res.returncode, " ".join(res.stderr.split())[-300:]))
+        lrc_config = os.path.join(tree, "debian", "lrc.config")
+        if os.path.exists(lrc_config):
+            notes.extend("lrc.config: " + l.rstrip("\n") for l in open(lrc_config)
+                         if l.strip() and not l.startswith("#"))
         res = subprocess.run(["lrc"], cwd=tree, capture_output=True, text=True)
         out = (res.stdout + res.stderr).strip()
         if res.returncode == 1:
             errors.extend("lrc: " + l for l in out.splitlines())
+            if not out:
+                errors.append("lrc FAILED with exit 1 and no output")
         elif res.returncode == 3:
             e, n = read_lrc(out)
             errors += e
             notes += n
-        else:
+            if not e and not n:
+                errors.append("lrc reported differences that pie-verify cannot read: %s" % " ".join(out.split())[:300])
+        elif res.returncode == 0:
             notes.append("lrc: no differences")
+        else:
+            errors.append("lrc FAILED with exit %d: %s" % (res.returncode, " ".join(out.split())[:300]))
         errors += grep_markers(tree, "source")
         files = []
         for d, dirs, fs in os.walk(tree):
@@ -345,13 +444,25 @@ def check(dsc, debs, chroot, full_dsc):
     print("all checks passed")
 
 
+def options(words, names):
+    """{name: value} of WORDS, each a name of NAMES and its value; anything else is a usage error."""
+    out = {}
+    if len(words) % 2 or any(w not in names for w in words[::2]) or len(set(words[::2])) != len(words) // 2:
+        sys.exit("pie-verify: bad options %s\n%s" % (" ".join(words), __doc__))
+    for k, v in zip(words[::2], words[1::2]):
+        out[k] = v
+    return out
+
+
 def main():
+    fixed_environment()
     a = sys.argv[1:]
     if len(a) >= 3 and a[0] == "compare":
-        compare(a[1], a[2], a[a.index("--allow-missing") + 1] if "--allow-missing" in a else None)
+        o = options(a[3:], ("--allow-missing",))
+        compare(a[1], a[2], o.get("--allow-missing"))
     elif len(a) >= 2 and a[0] == "check":
-        opt = lambda k: a[a.index(k) + 1] if k in a else None
-        check(os.path.abspath(a[1]), opt("--debs"), opt("--chroot"), opt("--full-dsc"))
+        o = options(a[2:], ("--debs", "--chroot", "--full-dsc"))
+        check(os.path.abspath(a[1]), o.get("--debs"), o.get("--chroot"), o.get("--full-dsc"))
     else:
         sys.exit(__doc__)
 
