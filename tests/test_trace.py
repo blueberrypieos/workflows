@@ -61,7 +61,10 @@ def test_trace_records_private_mounts(tool, monkeypatch, tmp_path, build_rc):
 
 
 @pytest.mark.parametrize('unshare', [False, True])
-def test_dependency_capture_precedes_compilation_under_lock(tool, monkeypatch, tmp_path, unshare):
+@pytest.mark.parametrize('different', [False, True])
+@pytest.mark.parametrize('native_reference', [False, True])
+def test_dependency_capture_precedes_compilation_under_lock(tool, monkeypatch, tmp_path, unshare, different, native_reference):
+    import hashlib
     import json
     import shutil
     from types import SimpleNamespace
@@ -75,6 +78,15 @@ def test_dependency_capture_precedes_compilation_under_lock(tool, monkeypatch, t
     dsc = tmp_path / 'test.dsc'
     dsc.write_text('source package')
     out = tmp_path / 'output'
+    expected = tmp_path / 'expected.lock'
+    native_record = ''
+    if native_reference:
+        archive = b'native archive'
+        digest = hashlib.sha256(archive).hexdigest()
+        (tmp_path / 'cross-deps/archives').mkdir(parents=True)
+        (tmp_path / 'cross-deps/archives' / (digest + '.deb')).write_bytes(archive)
+        native_record = 'build\tnative-example\tamd64\t1\t' + digest + '\n'
+    expected.write_text(native_record + ('host\texample\tdarwin-arm64\t1\t' + 'a' * 64 + '\n' if different else ''))
     events = []
     monkeypatch.setitem(namespace, 'dsc_fields', lambda path: ('test', '1', []))
     monkeypatch.setitem(namespace, 'sh', lambda *args, **kw: None)
@@ -93,19 +105,29 @@ def test_dependency_capture_precedes_compilation_under_lock(tool, monkeypatch, t
     monkeypatch.setitem(namespace, 'sudo', sudo)
     original_rename = namespace['os'].rename
     def rename(source, destination):
-        assert Path(source).name == 'evidence' and Path(destination) == out / 'cross-deps'
-        assert events == (['resolved'] if unshare else ['resolved', 'owned'])
-        events.append('exported')
+        if Path(source).name == 'evidence':
+            assert Path(destination) == out / 'cross-deps'
+            assert events == (['resolved'] if unshare else ['resolved', 'owned'])
+            events.append('exported')
+        else:
+            assert Path(source).name in ('base.lock', 'cross-deps.lock')
+            assert Path(destination) == out / Path(source).name
         original_rename(source, destination)
     monkeypatch.setattr(namespace['os'], 'rename', rename)
     def external(argv, **kwargs):
         script = argv[0]
         if 'flock /work/.pie-cross-deps.lock' in script:
             assert 'apt-get update' in script and 'python3 /run/pie-cross/pie-cross-record' in script
+            assert '--cross-deps-lock /run/pie-cross/reference/cross-deps.lock' in script
             assert '/usr/share/pietoolchain/pie-cross-deps' in script
+            assert (Path(argv[1]) / 'reference/cross-deps.lock').read_bytes() == expected.read_bytes()
+            if native_reference:
+                assert (Path(argv[1]) / 'reference/archives' / (digest + '.deb')).read_bytes() == archive
             capture = Path(argv[1]) / 'evidence'
             capture.mkdir()
             (capture / 'receipt.json').write_text('{"captured": true}')
+            (capture / 'base.lock').write_text('')
+            (capture / 'cross-deps.lock').write_text(native_record)
             events.append('resolved')
         else:
             assert events == ['resolved'] + ([] if unshare else ['owned']) + ['exported', 'captured']
@@ -113,8 +135,13 @@ def test_dependency_capture_precedes_compilation_under_lock(tool, monkeypatch, t
             events.append('compiled')
         return SimpleNamespace(returncode=0)
     monkeypatch.setattr(namespace['subprocess'], 'run', external)
-    trace['run_trace'](str(root), str(dsc), str(out), 1, True, 'test', cross_deps=True)
-    assert events == ['resolved'] + ([] if unshare else ['owned']) + ['exported', 'captured', 'compiled']
+    if different:
+        with pytest.raises(ValueError, match='example'):
+            trace['run_trace'](str(root), str(dsc), str(out), 1, True, 'test', cross_deps_lock=str(expected))
+    else:
+        trace['run_trace'](str(root), str(dsc), str(out), 1, True, 'test', cross_deps_lock=str(expected))
+        assert json.loads((out / 'meta.json').read_text())['cross_deps'] is True
+    assert events == ['resolved'] + ([] if unshare else ['owned']) + ['exported', 'captured'] + ([] if different else ['compiled'])
 
 
 @pytest.mark.parametrize('removal_fails', [False, True])
@@ -163,6 +190,8 @@ def test_build_parent_excludes_recorder_artifacts(tool, monkeypatch, tmp_path, r
             (evidence / 'archives').mkdir(parents=True)
             (evidence / 'status').write_text('resolver state')
             (evidence / 'receipt.json').write_text('{}')
+            (evidence / 'base.lock').write_text('')
+            (evidence / 'cross-deps.lock').write_text('')
             (evidence / 'archives/dependency.deb').write_bytes(b'deb')
         else:
             snapshots.append(sorted(p.name for p in work.iterdir()))

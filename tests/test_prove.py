@@ -86,7 +86,7 @@ def test_reused_traces_require_private_mounts(tmp_path, mode, recorded):
         (out / 'meta.json').write_text(json.dumps(metadata))
     (tmp_path / 'test-commit.txt').write_text('test-head\n')
     source = (TOOLS / 'pie-prove').read_text()
-    block = source[source.index('resume= checkonly='):source.index('# The full and the reduced build run at once')]
+    block = source[source.index('resume= checkonly='):source.index('# The full and reduced builds use separate slots')]
     setup = 'set -euo pipefail\nname=test head=test-head\nout=$OUT tools=$TOOLS\n'
     result = subprocess.run(['bash', '-c', setup + block + 'printf "REUSE_ACCEPTED\\n"'],
                             env=dict(os.environ, OUT=str(tmp_path), TOOLS=str(TOOLS),
@@ -321,3 +321,130 @@ def test_default_root_refuses_reuse_of_discarded_build_state(tmp_path, variable)
                             capture_output=True, text=True)
     assert result.returncode == 2
     assert 'working copy is removed' in result.stderr
+
+
+@pytest.mark.parametrize('mismatch', [False, True])
+def test_locked_proof_waits_for_full_and_checks_reduced(tmp_path, mismatch):
+    import hashlib
+    tools = tmp_path / 'tools'
+    tools.mkdir()
+    (tools / 'pielib').symlink_to(TOOLS / 'pielib', target_is_directory=True)
+    script = tools / 'pie-trace'
+    script.write_text('''#!/bin/bash
+set -eu
+if [[ " $* " == *" --slot F "* ]]; then
+    sleep 0.05
+    mkdir "$OUT/test-tF"
+    printf 'host\\texample\\tdarwin-arm64\\t1\\t%s\\n' "$SHA" > "$OUT/test-tF/cross-deps.lock"
+    touch "$OUT/full-finished"
+else
+    test -f "$OUT/full-finished"
+    [[ " $* " == *" --cross-deps-lock $OUT/test-tF/cross-deps.lock "* ]]
+    mkdir "$OUT/test-tR"
+    cp "$OUT/test-tF/cross-deps.lock" "$OUT/test-tR/cross-deps.lock"
+    if [ "$MISMATCH" = yes ]; then sed -i s/example/different/ "$OUT/test-tR/cross-deps.lock"; fi
+fi
+''')
+    script.chmod(0o755)
+    source = (TOOLS / 'pie-prove').read_text()
+    block = source[source.index('fpid=\n'):source.index('if [ -n "$resume" ]; then\n\t# The full')]
+    setup = '''set -euo pipefail
+cleanup_root() { :; }
+name=test src=test ver=1 jobs=1
+root=/unused
+checkonly= resume=
+leave=() trace_args=(--cross-deps)
+hd=$OUT/hd tools=$TOOLS out=$OUT
+'''
+    result = subprocess.run(['bash', '-c', setup + block], capture_output=True, text=True,
+                            env=dict(os.environ, OUT=str(tmp_path), TOOLS=str(tools),
+                                     SHA=hashlib.sha256(b'dep').hexdigest(), MISMATCH='yes' if mismatch else 'no'))
+    assert (result.returncode != 0) == mismatch, result.stderr
+    if mismatch:
+        assert 'example' in result.stderr and 'different' in result.stderr
+
+
+@pytest.mark.parametrize('mode', ['check', 'resume'])
+@pytest.mark.parametrize('evidence', ['lock', 'metadata', 'log', 'directory'])
+@pytest.mark.parametrize('mismatch', [False, True])
+def test_retained_locks_are_enforced_without_repeating_cross_deps(tmp_path, mode, evidence, mismatch):
+    import json
+    tools = tmp_path / 'tools'
+    tools.mkdir()
+    (tools / 'pielib').symlink_to(TOOLS / 'pielib', target_is_directory=True)
+    program = tools / 'pie-trace'
+    program.write_text('''#!/bin/bash
+set -eu
+if [[ " $* " != *" --analyse "* ]]; then
+    [[ " $* " == *" --cross-deps "* ]]
+    [[ " $* " == *" --cross-deps-lock $OUT/test-tF/cross-deps.lock "* ]]
+    cp "$OUT/test-tF/cross-deps.lock" "$OUT/test-tR/cross-deps.lock"
+    if [ "$MISMATCH" = yes ]; then sed -i 's/\\t1\\t/\\t2\\t/' "$OUT/test-tR/cross-deps.lock"; fi
+fi
+''')
+    program.chmod(0o755)
+    for side in ('F', 'R'):
+        trace = tmp_path / ('test-t' + side)
+        trace.mkdir()
+        version = '2' if side == 'R' and mismatch else '1'
+        (trace / 'cross-deps.lock').write_text('host\texample\tdarwin-arm64\t' + version + '\t' + 'a' * 64 + '\n')
+        if evidence == 'metadata':
+            (trace / 'meta.json').write_text(json.dumps({'cross_deps': True}))
+        elif evidence == 'log':
+            (trace / 'cross-deps.log').write_text('dependency preparation ran\n')
+        elif evidence == 'directory':
+            (trace / 'cross-deps').mkdir()
+    source = (TOOLS / 'pie-prove').read_text()
+    block = source[source.index('fpid=\n'):source.index('if [ -n "$resume" ]; then\n\t# The full')]
+    setup = '''set -euo pipefail
+cleanup_root() { :; }
+name=test src=test ver=1 jobs=1 root=/unused
+resume=1 checkonly=$CHECK
+leave=() trace_args=()
+hd=$OUT/hd tools=$TOOLS out=$OUT
+'''
+    result = subprocess.run(['bash', '-c', setup + block + '\necho ACCEPTED'], capture_output=True, text=True,
+                            env=dict(os.environ, OUT=str(tmp_path), TOOLS=str(tools), CHECK='1' if mode == 'check' else '',
+                                     MISMATCH='yes' if mismatch else 'no'))
+    assert (result.returncode != 0) == mismatch, result.stderr
+    if mismatch:
+        assert 'cross dependency lock differs' in result.stderr
+        assert 'ACCEPTED' not in result.stdout
+    else:
+        assert result.stdout == 'ACCEPTED\n'
+
+
+@pytest.mark.parametrize('mode,missing', [('check', 'F'), ('check', 'R'), ('resume', 'F'), ('check', 'both'), ('resume', 'both')])
+@pytest.mark.parametrize('evidence', ['metadata', 'log', 'directory'])
+def test_retained_dependency_evidence_rejects_missing_locks(tmp_path, mode, missing, evidence):
+    import json
+    tools = tmp_path / 'tools'
+    tools.mkdir()
+    (tools / 'pielib').symlink_to(TOOLS / 'pielib', target_is_directory=True)
+    program = tools / 'pie-trace'
+    program.write_text('#!/bin/sh\nexit 0\n')
+    program.chmod(0o755)
+    for side in ('F', 'R'):
+        trace = tmp_path / ('test-t' + side)
+        trace.mkdir()
+        if side != missing and missing != 'both':
+            (trace / 'cross-deps.lock').write_text('')
+        if evidence == 'metadata':
+            (trace / 'meta.json').write_text(json.dumps({'cross_deps': True}))
+        elif evidence == 'log':
+            (trace / 'cross-deps.log').write_text('dependency preparation ran\n')
+        else:
+            (trace / 'cross-deps').mkdir()
+    source = (TOOLS / 'pie-prove').read_text()
+    block = source[source.index('fpid=\n'):source.index('if [ -n "$resume" ]; then\n\t# The full')]
+    setup = '''set -euo pipefail
+cleanup_root() { :; }
+name=test src=test ver=1 jobs=1 root=/unused
+resume=1 checkonly=$CHECK
+leave=() trace_args=()
+hd=$OUT/hd tools=$TOOLS out=$OUT
+'''
+    result = subprocess.run(['bash', '-c', setup + block], capture_output=True, text=True,
+                            env=dict(os.environ, OUT=str(tmp_path), TOOLS=str(tools), CHECK='1' if mode == 'check' else ''))
+    assert result.returncode != 0
+    assert 'cross-deps.lock' in result.stderr

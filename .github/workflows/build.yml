@@ -109,8 +109,6 @@ jobs:
   binary:
     needs: source
     runs-on: ubuntu-26.04
-    # A clean system with no checkout: the build sees only the source
-    # package, pietoolchain, the SDK and the build dependencies.
     container: ubuntu:26.04
     permissions:
       contents: read
@@ -121,7 +119,16 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl gnupg dpkg-dev build-essential devscripts
+            ca-certificates curl gnupg git dpkg-dev build-essential devscripts
+
+      - name: The workflows' tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: blueberrypieos/workflows
+          ref: ${{ env.WORKFLOWS_REF }}
+          path: .workflows
+          persist-credentials: false
+          sparse-checkout: tools/
 
       - name: pietoolchain and pietoolchain-sdk
         run: |
@@ -172,11 +179,13 @@ jobs:
         id: deps
         run: |
           if [ -n '${{ inputs.ports-repository }}' ]; then
-            /usr/share/pietoolchain/pie-cross-deps /build/src
+            python3 .workflows/tools/pie-cross-record /usr/share/pietoolchain/pie-cross-deps /build/src /build/cross-deps
             echo "check=-d" >> "$GITHUB_OUTPUT"
           else
-            DEBIAN_FRONTEND=noninteractive apt-get build-dep -y --no-install-recommends /build/src
+            python3 .workflows/tools/pie-cross-record --build-dep /build/src /build/cross-deps
           fi
+          mkdir -p "$GITHUB_WORKSPACE/dist/.cross-deps"
+          cp /build/cross-deps/base.lock /build/cross-deps/cross-deps.lock "$GITHUB_WORKSPACE/dist/.cross-deps/"
 
       - name: Binary packages
         working-directory: /build/src
@@ -201,4 +210,5 @@ jobs:
         with:
           name: ${{ needs.source.outputs.name }}
           path: dist/
+          include-hidden-files: true
           if-no-files-found: error

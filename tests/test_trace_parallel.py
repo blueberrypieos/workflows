@@ -83,6 +83,8 @@ def test_compilation_cannot_read_sibling_recorder(tool, monkeypatch, tmp_path, c
             (evidence / 'archives').mkdir(parents=True)
             (evidence / 'status').write_text('resolver state')
             (evidence / 'receipt.json').write_text('{}')
+            (evidence / 'base.lock').write_text('')
+            (evidence / 'cross-deps.lock').write_text('')
             (evidence / 'archives/dependency.deb').write_bytes(b'deb')
             if side == resolving_side:
                 evidence_ready.set()

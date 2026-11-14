@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2026 The Blueberry Pie OS Authors
-"""usage: pie-trace --chroot ROOT DSC OUT [-j N] [-d] [--cross-deps] [--name NAME] [--leave-out FILE] [--full]
+"""usage: pie-trace --chroot ROOT DSC OUT [-j N] [-d] [--cross-deps] [--cross-deps-lock FILE] [--name NAME] [--leave-out FILE] [--full]
                  [--arch ARCH] [--build b|B|A] [--slot S] [--unshare] [--keep FILE] [--map FROM=TO]... [--scope PREFIX]...
        pie-trace --analyse OUT [--leave-out FILE] [--keep FILE] [--map FROM=TO]... [--scope PREFIX]...
 
@@ -40,6 +40,12 @@ time runs it in a chroot, under flock on /work/.pie-cross-deps.lock there.
 pie-cross-record stages outside ROOT, mounted on a private /run/pie-cross for
 dependency resolution only. It retains apt status and dependency debs in
 OUT/cross-deps before compilation. Installed target providers need matching cached debs.
+OUT/cross-deps.lock lists each new build package and target archive as side,
+package, architecture, version and archive sha256, sorted and tab-separated.
+OUT/base.lock lists the pre-existing build packages as side, package,
+architecture and version. Its file hash identifies this base package list.
+--cross-deps-lock FILE implies --cross-deps and requires the same dependency
+lock before compilation. A mismatch prints a unified diff and fails.
 pie-trace and what it runs see only PATH, TMPDIR and
 PIE_UNSHARE of the caller's environment, with LC_ALL=C.UTF-8 and
 HOME=/nonexistent.
@@ -96,6 +102,7 @@ from pielib.paths import traversed as _traversed
 from pielib.deb822 import dsc_fields, dsc_files, control_paragraphs
 from pielib.paths import fresh, within
 from pielib.proof import PRIVATE_TMPFS
+from pielib.cross_lock import check_lock, read_lock
 
 
 COPY_TOOLS = {"cp", "tar", "rsync", "cpio", "pax", "bsdtar", "find", "ditto"}
@@ -253,7 +260,20 @@ def collected_debs(work, debs):
 
 
 def run_trace(root, dsc, out, jobs, nodeps, name, full=False, arch="darwin-arm64", build_type="b", slot=None, inputs=(),
-              cross_deps=False):
+              cross_deps=False, cross_deps_lock=None):
+    reference_archives = []
+    if cross_deps_lock:
+        cross_deps_lock = os.path.abspath(cross_deps_lock)
+        for side, package, architecture, version, sha in read_lock(cross_deps_lock):
+            if side != 'build':
+                continue
+            for directory in ('archives', 'cross-deps/archives'):
+                path = os.path.join(os.path.dirname(cross_deps_lock), directory, sha + '.deb')
+                if os.path.exists(path):
+                    reference_archives.append((path, sha))
+        inputs = list(inputs) + [cross_deps_lock]
+        inputs += [path for path, sha in reference_archives]
+        cross_deps = True
     src, version, files = dsc_fields(dsc)
     name = name or src
     check_name("the trace's name", name)
@@ -305,8 +325,23 @@ def run_trace(root, dsc, out, jobs, nodeps, name, full=False, arch="darwin-arm64
             staging = tempfile.mkdtemp(prefix='.cross-deps-', dir=out)
             try:
                 shutil.copyfile(recorder, staging + '/pie-cross-record')
+                os.mkdir(staging + '/pielib')
+                shutil.copyfile(os.path.join(os.path.dirname(recorder), 'pielib/cross_lock.py'),
+                                staging + '/pielib/cross_lock.py')
+                reference = ''
+                if cross_deps_lock:
+                    os.mkdir(staging + '/reference')
+                    os.mkdir(staging + '/reference/archives')
+                    shutil.copyfile(cross_deps_lock, staging + '/reference/cross-deps.lock')
+                    for path, sha in reference_archives:
+                        destination = staging + '/reference/archives/' + sha + '.deb'
+                        shutil.copyfile(path, destination)
+                        with open(destination, 'rb') as stream:
+                            if hashlib.file_digest(stream, 'sha256').hexdigest() != sha:
+                                die('reference dependency archive differs: ' + path)
+                    reference = '--cross-deps-lock /run/pie-cross/reference/cross-deps.lock '
                 deps = ("apt-get update -q && cd %s/src && %spython3 /run/pie-cross/pie-cross-record "
-                        "/usr/share/pietoolchain/pie-cross-deps . /run/pie-cross/evidence") % (inside, cross)
+                        "%s/usr/share/pietoolchain/pie-cross-deps . /run/pie-cross/evidence") % (inside, cross, reference)
                 rc = subprocess.run(in_root(root, "flock /work/.pie-cross-deps.lock sh -c %s" % shlex.quote(deps),
                                             bind=bind, staging=staging), stdout=log, stderr=subprocess.STDOUT).returncode
                 if rc != 0:
@@ -314,6 +349,10 @@ def run_trace(root, dsc, out, jobs, nodeps, name, full=False, arch="darwin-arm64
                 if not UNSHARE:
                     sudo('chown', '-R', '%d:%d' % (os.getuid(), os.getgid()), staging + '/evidence')
                 os.rename(staging + '/evidence', out + '/cross-deps')
+                for filename in ('base.lock', 'cross-deps.lock'):
+                    os.rename(out + '/cross-deps/' + filename, out + '/' + filename)
+                if cross_deps_lock:
+                    check_lock(out + '/cross-deps.lock', cross_deps_lock)
             finally:
                 sudo('rm', '-rf', staging)
     before = tree_state(w + "/src")
@@ -351,6 +390,7 @@ def run_trace(root, dsc, out, jobs, nodeps, name, full=False, arch="darwin-arm64
                "dsc_sha256": dsc_sha256, "src": src, "version": version,
                "rc": rc, "members": members, "orig_debian": orig_debian, "atimes": atimes,
                "tree_changes": len(changes), "expected_debs": expected_debs,
+               "cross_deps": bool(cross_deps),
                "private_tmpfs": PRIVATE_TMPFS if rc == 0 else None},
               fresh(os.path.join(out, "meta.json")))
     if rc != 0:
@@ -734,6 +774,7 @@ def main():
     ap.add_argument("-j", dest="jobs", type=int, default=os.cpu_count())
     ap.add_argument("-d", dest="nodeps", action="store_true")
     ap.add_argument("--cross-deps", action="store_true")
+    ap.add_argument("--cross-deps-lock", help="prepare dependencies and require the same lock before compilation")
     ap.add_argument("--name")
     ap.add_argument("--leave-out")
     ap.add_argument("--full", action="store_true")
@@ -758,5 +799,5 @@ def main():
             if v is not None:
                 check_name(what, v)
         run_trace(a.chroot, a.dsc, out, a.jobs, a.nodeps, a.name, a.full, a.arch, a.build, a.slot,
-                  [p for p in (a.leave_out, a.keep) if p], a.cross_deps)
+                  [p for p in (a.leave_out, a.keep) if p], a.cross_deps, a.cross_deps_lock)
     analyse(out, a.leave_out and os.path.abspath(a.leave_out), a.map, a.scope, a.keep and os.path.abspath(a.keep))

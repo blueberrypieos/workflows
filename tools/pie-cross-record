@@ -2,20 +2,34 @@
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2026 The Blueberry Pie OS Authors
 """usage: pie-cross-record HELPER SOURCE EVIDENCE
+       pie-cross-record --build-dep SOURCE EVIDENCE
+       pie-cross-record --cross-deps-lock FILE HELPER SOURCE EVIDENCE
 
 Run the installed dependency resolver with a retained temporary directory.
 Save its apt status and the actual downloaded or cached target archives.
+Keep native apt downloads and record the before and after package status.
+Write cross-deps.lock and base.lock in EVIDENCE.
 Run inside the build's dependency lock, before compilation.
+--cross-deps-lock keeps the full build's native selection when reusing a root.
 """
 from email.parser import Parser
+import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
 import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pielib.cross_lock import check_lock, lock_text, read_lock
+
+DPKG_STATUS = Path('/var/lib/dpkg/status')
+APT_ARCHIVES = Path('/var/cache/apt/archives')
 
 
 class TemporaryFiles:
@@ -57,6 +71,103 @@ def identity(path):
 def digest(path):
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def build_packages(status):
+    result = {}
+    for paragraph in re.split(r'\n\s*\n', status.read_text().strip()):
+        package = Parser().parsestr(paragraph)
+        if package.get('Status') == 'install ok installed' and package.get('Architecture') != 'darwin-arm64':
+            key = (package['Package'], package['Architecture'])
+            if not all(key) or not package.get('Version'):
+                raise ValueError('installed package has no identity')
+            result[key] = package['Version']
+    return result
+
+
+class ObservedProcesses:
+    def __init__(self, archives):
+        self.archives = archives
+
+    def run(self, argv, **kwargs):
+        if argv[:2] in (['apt-get', 'satisfy'], ['apt-get', 'build-dep']):
+            argv = [argv[0], '-o', 'Dir::Cache::archives=' + str(self.archives),
+                    '-o', 'APT::Keep-Downloaded-Packages=true',
+                    '-o', 'Binary::apt-get::APT::Keep-Downloaded-Packages=true'] + argv[1:]
+        return subprocess.run(argv, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(subprocess, name)
+
+
+def native_selection(before, after, expected):
+    selected = {key for key, version in after.items() if before.get(key) != version}
+    selected.update((name, arch) for side, name, arch, version, sha in expected
+                    if side == 'build' and (name, arch) in after)
+    return selected
+
+
+def retain_native(required, after, cache, available):
+    wanted = {(name, after[name, arch], arch) for name, arch in required}
+    if not wanted:
+        return
+    found = set()
+    for directory in (cache, available):
+        for path in sorted(directory.glob('*.deb')):
+            key = identity(path)
+            if key not in wanted:
+                continue
+            found.add(key)
+            destination = cache / (digest(path) + '.deb')
+            if directory != cache and not destination.exists():
+                shutil.copyfile(path, destination)
+    missing = sorted(wanted - found)
+    if missing:
+        exact = [name + (':' + arch if arch != 'all' else '') + '=' + version for name, version, arch in missing]
+        subprocess.run(['apt-get', 'download', '-q', *exact], cwd=cache, check=True)
+
+
+def copy_reference(lock, expected, cache):
+    for side, name, arch, version, sha in expected:
+        if side != 'build':
+            continue
+        paths = [lock.parent / directory / (sha + '.deb') for directory in ('archives', 'cross-deps/archives')]
+        path = next((path for path in paths if path.exists()), None)
+        if path is None:
+            continue
+        if digest(path) != sha or identity(path) != (name, version, arch):
+            raise ValueError('reference build dependency archive differs: ' + name)
+        destination = cache / (sha + '.deb')
+        shutil.copyfile(path, destination)
+        if digest(destination) != sha:
+            raise ValueError('reference build dependency archive changed during capture: ' + name)
+
+
+def write_locks(evidence, before, after, cache, expected):
+    (evidence / 'base.lock').write_text(''.join('\t'.join(('build', name, arch, version)) + '\n'
+        for (name, arch), version in sorted(before.items())))
+    records = []
+    targets = json.loads((evidence / 'receipt.json').read_text())['packages']
+    for package in targets:
+        records.append(('host', package['package'], package['architecture'], package['version'], package['sha256']))
+    archives = {}
+    for path in sorted(cache.glob('*.deb')):
+        name, version, arch = identity(path)
+        archives.setdefault((name, arch, version), []).append(path)
+    for name, arch in sorted(native_selection(before, after, expected)):
+        version = after[name, arch]
+        candidates = archives.get((name, arch, version), [])
+        if not candidates or len({digest(path) for path in candidates}) != 1:
+            raise ValueError('installed build dependency needs a unique retained archive: ' + name)
+        sha = digest(candidates[0])
+        shutil.copyfile(candidates[0], evidence / 'archives' / (sha + '.deb'))
+        if digest(evidence / 'archives' / (sha + '.deb')) != sha:
+            raise ValueError('build dependency archive changed during capture: ' + name)
+        records.append(('build', name, arch, version, sha))
+    removed = before.keys() - after.keys()
+    if removed:
+        raise ValueError('dependency preparation removed base packages: ' + ', '.join(name for name, arch in sorted(removed)))
+    (evidence / 'cross-deps.lock').write_text(lock_text(records))
 
 
 def capture(state, evidence, cache=Path('/var/cache/apt/archives')):
@@ -104,17 +215,44 @@ def capture(state, evidence, cache=Path('/var/cache/apt/archives')):
 
 
 def main():
-    helper, source, output = map(Path, sys.argv[1:])
-    namespace = runpy.run_path(str(helper))['main'].__globals__
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--cross-deps-lock', type=Path)
+    parser.add_argument('--build-dep', action='store_true')
+    parser.add_argument('paths', nargs='+', type=Path)
+    args = parser.parse_args()
+    build_dep = args.build_dep
+    if len(args.paths) != (2 if build_dep else 3):
+        parser.error('expected SOURCE EVIDENCE with --build-dep, otherwise HELPER SOURCE EVIDENCE')
+    helper, source, output = (None, *args.paths) if build_dep else args.paths
+    expected = read_lock(args.cross_deps_lock) if args.cross_deps_lock else []
+    namespace = None if build_dep else runpy.run_path(str(helper))['main'].__globals__
     with tempfile.TemporaryDirectory(dir=output.parent) as scratch:
+        archives = Path(scratch) / 'native'
+        (archives / 'partial').mkdir(parents=True)
+        os_status = DPKG_STATUS
+        before = build_packages(os_status)
+        if args.cross_deps_lock:
+            copy_reference(args.cross_deps_lock, expected, archives)
         temporary = TemporaryFiles(scratch)
-        namespace['tempfile'] = temporary
-        namespace['shutil'] = RetainedFiles(temporary)
-        sys.argv = [str(helper), str(source)]
-        namespace['main']()
+        if build_dep:
+            ObservedProcesses(archives).run(['apt-get', 'build-dep', '-y', '--no-install-recommends', str(source)],
+                                          check=True, env=dict(os.environ, DEBIAN_FRONTEND='noninteractive'))
+            Path(temporary.mkdtemp(), 'status').write_text('')
+        else:
+            namespace['tempfile'] = temporary
+            namespace['shutil'] = RetainedFiles(temporary)
+            namespace['subprocess'] = ObservedProcesses(archives)
+            sys.argv = [str(helper), str(source)]
+            namespace['main']()
         if temporary.path is None:
             raise ValueError('dependency resolver did not retain its apt state')
         capture(temporary.path, output)
+        shutil.copyfile(os_status, output / 'build-status')
+        after = build_packages(output / 'build-status')
+        retain_native(native_selection(before, after, expected), after, archives, APT_ARCHIVES)
+        write_locks(output, before, after, archives, expected)
+        if args.cross_deps_lock:
+            check_lock(output / 'cross-deps.lock', args.cross_deps_lock)
 
 
 if __name__ == '__main__':

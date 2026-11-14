@@ -126,6 +126,9 @@ export GIT_NO_REPLACE_OBJECTS=1
 # PIE_TRACE_ARGS: more pie-trace options for both builds, only -d,
 # --cross-deps, --map, --scope, --arch and --build. The report's first line
 # names them.
+# With --cross-deps the full build finishes first. The reduced build must
+# match its cross-deps.lock. Resume and check-only require those locks too.
+# Retained dependency evidence requires locks even without --cross-deps.
 # PIE_PROVE_SOURCES=PREFIX: use the source packages in PREFIX-F and
 # PREFIX-R, another proof's. Its PREFIX-commit.txt must name HEAD, as must
 # NAME-commit.txt of an earlier proof that is resumed or checked.
@@ -266,8 +269,7 @@ from pielib.proof import require_private_tmpfs
 require_private_tmpfs(sys.argv[2:])
 EOF
 fi
-# The full and the reduced build run at once, each in a slot of its own
-# (the same path in the chroot).
+# The full and reduced builds use separate slots at the same path.
 fpid=
 rpid=
 stop_traces() {
@@ -289,15 +291,50 @@ elif [ -z "$resume" ]; then
 	setsid "$tools/pie-trace" --chroot "$root" "$out/$name-F/${src}_$ver.dsc" "$out/$name-tF" -j "$jobs" --name "$name" --full "${leave[@]}" "${trace_args[@]}" --slot F > "$out/$name-tF.txt" &
 	fpid=$!
 fi
+locked=()
+lock_required=no
+if [[ " ${trace_args[*]} " == *" --cross-deps "* ]]; then
+	[ -z "$fpid" ] || wait "$fpid"
+	fpid=
+	lock_required=yes
+elif [ -n "$resume" ] || [ -n "$checkonly" ]; then
+	lock_required=$(python3 -I - "$tools" "$out/$name-tF" "$out/$name-tR" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from pielib.cross_lock import retained_lock_required
+print('yes' if retained_lock_required(sys.argv[2:]) else 'no')
+EOF
+)
+fi
+if [ "$lock_required" = yes ]; then
+	python3 -I - "$tools" "$out/$name-tF/cross-deps.lock" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from pielib.cross_lock import read_lock
+read_lock(sys.argv[2])
+EOF
+	locked=(--cross-deps-lock "$out/$name-tF/cross-deps.lock")
+	if ! [[ " ${trace_args[*]} " == *" --cross-deps "* ]]; then
+		trace_args+=(--cross-deps)
+	fi
+fi
 [ -n "$checkonly" ] || rm -f "$out/$name-tR.txt"
 if [ -z "$checkonly" ]; then
-	setsid "$tools/pie-trace" --chroot "$root" "$out/$name-R/${src}_$ver.dsc" "$out/$name-tR" -j "$jobs" --name "$name" "${trace_args[@]}" --slot R > "$out/$name-tR.txt" &
+	setsid "$tools/pie-trace" --chroot "$root" "$out/$name-R/${src}_$ver.dsc" "$out/$name-tR" -j "$jobs" --name "$name" "${trace_args[@]}" "${locked[@]}" --slot R > "$out/$name-tR.txt" &
 	rpid=$!
 	wait "$rpid" || exit 1
 	rpid=
 fi
 [ -z "$fpid" ] || wait "$fpid"
 fpid=
+if [ ${#locked[@]} -ne 0 ]; then
+	python3 -I - "$tools" "$out/$name-tR/cross-deps.lock" "$out/$name-tF/cross-deps.lock" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from pielib.cross_lock import check_lock
+check_lock(sys.argv[2], sys.argv[3])
+EOF
+fi
 if [ -n "$resume" ]; then
 	# The full build's trace is an earlier run's: analyse it with the current options.
 	rm -f "$out/$name-tF.txt"

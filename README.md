@@ -75,23 +75,25 @@ The `source` job:
    restricted-text markers; and files for other architectures;
 4. uploads it as the artifact `SOURCE_VERSION_source`.
 
-The `binary` job runs in a new `ubuntu:26.04` container, with no checkout:
+The `binary` job runs in a new `ubuntu:26.04` container. It checks out only
+this repository's tools, never the packaging repository:
 
-1. downloads pietoolchain and pietoolchain-sdk from the pietoolchain
+1. checks out this repository's tools into `.workflows`;
+2. downloads pietoolchain and pietoolchain-sdk from the pietoolchain
    release it pins, checks their SHA-256 hashes and installs them;
-2. extracts the source package with `dpkg-source -x`;
-3. installs the build dependencies (`apt-get build-dep`);
-4. builds the binary packages from the extracted source alone:
+3. extracts the source package with `dpkg-source -x`;
+4. installs the build dependencies (`apt-get build-dep`);
+5. builds the binary packages from the extracted source alone:
 
    ```sh
    dpkg-buildpackage -a darwin-arm64 -b -us -uc -j$(nproc)
    ```
 
-5. merges the source and binary `.changes`, and collects every file it
+6. merges the source and binary `.changes`, and collects every file it
    lists: the source package (`.dsc`, `.orig.tar.*`, `.debian.tar.*`), the
    `.deb` of each binary package, the `.buildinfo`, and the `.changes`
    itself;
-6. uploads them as one artifact, named `SOURCE_VERSION` (the version
+7. uploads them as one artifact, named `SOURCE_VERSION` (the version
    without its epoch; `outputs.artifact` gives the name).
 
 A file the source package leaves out cannot reach a binary package: the
@@ -392,3 +394,37 @@ tools/pie compare HEAD~ HEAD --mode tree --out compare-tree
 tools/pie compare old-tree new-tree --mode tree
 tools/pie compare old.deb new.deb --mode package --json
 ```
+
+### Recording cross dependencies
+
+Pass `--cross-deps` to `pie trace`, or set `PIE_TRACE_ARGS=--cross-deps`
+for `pie prove`. The installed `pie-cross-deps` resolves the dependencies.
+Each trace retains the actual archives and writes `cross-deps.lock` with
+sorted tab-separated fields: side, package, architecture, version and
+SHA256 of the deb. Side is `build` for native dependencies.
+Side is `host` for unpacked darwin-arm64 dependencies. `base.lock` records
+the native packages and versions installed before dependency preparation.
+The full build records native packages that dependency preparation adds or
+upgrades. The reduced build carries that native selection forward.
+It records the actual installed versions, including packages already
+present before preparation. It also records new native changes.
+Unchanged packages already in the full build's base stay in `base.lock`.
+
+Reference native archives are checked by identity and SHA256.
+They are available only during dependency preparation. They do not pin
+APT's resolution. Missing archives are fetched by exact installed version.
+No replacement versions are resolved. A missing or changed native package
+or archive causes comparison to fail.
+
+Use `pie trace --cross-deps --cross-deps-lock FILE` to require an identical
+resolved lock. A differing package, version or hash fails with a diff.
+With cross dependencies, `pie prove` finishes the full build first and
+requires the reduced build's lock to match. Resume and check-only require
+matching locks too. Retained trace metadata, logs and dependency files
+determine whether locks are required, even if PIE_TRACE_ARGS omits
+--cross-deps. Resume then records and checks the new reduced build's
+dependencies. Missing required locks fail. Rebuild older traces that lack
+them. `base.lock` records each build's starting native environment.
+
+The binary CI job retains the same locks under `.cross-deps/` in its build
+artifact. Toolchain release versions and hashes are in `build.yml`.
