@@ -1,9 +1,12 @@
 #!/bin/bash -p
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2026 The Blueberry Pie OS Authors
-# usage: pie-prove REPO NAME CHROOT [JOBS]
+# usage: pie-prove REPO NAME [CHROOT] [JOBS]
 # NAME has only letters, digits and ._+- and starts with a letter or digit.
-# CHROOT is required. JOBS defaults to 8.
+# Omitted, empty or - CHROOT uses the cached recipe root. JOBS defaults to 8.
+# A numeric third argument is refused. Use - JOBS for the default root.
+# Default-root proofs use a disposable working copy and do not support resume
+# or check-only. Use an explicit CHROOT to retain build state between runs.
 # Builds REPO's HEAD as a full and as a reduced source package, builds the
 # binary packages of each from its .dsc under pie-trace in CHROOT, compares
 # them (pie-verify compare) and checks the reduced one (pie-verify check).
@@ -38,10 +41,18 @@
 # its #! line: started as "bash pie-prove", exported functions reach it. pie-prove runs lintian on the
 # reduced .dsc for the report, and fails if lintian fails. git takes no
 # replace refs. pie-prove and what it runs see only PATH, TMPDIR, PIE_OUT,
-# PIE_UNSHARE and the variables below of the caller's environment, with
+# PIE_UNSHARE, PIE_ROOT_CACHE, PIE_ROOT_TMPDIR, PIE_ROOT_RECIPE and the
+# variables below of the caller's environment, with
 # LC_ALL=C.UTF-8 and HOME=/nonexistent. PIE_UNSHARE=1 is passed to pie-trace.
 set -euo pipefail
-own="PIE_OUT PIE_TRACE_ARGS PIE_PROVE_SOURCES PIE_PROVE_CHECK_ONLY PIE_PROVE_RESUME PIE_UNSHARE"
+own="PIE_OUT PIE_TRACE_ARGS PIE_PROVE_SOURCES PIE_PROVE_CHECK_ONLY PIE_PROVE_RESUME PIE_UNSHARE PIE_ROOT_CACHE PIE_ROOT_TMPDIR PIE_ROOT_RECIPE"
+if [ -z "${PIE_ROOT_CACHE+x}" ]; then
+	if [ -n "${XDG_CACHE_HOME:-}" ]; then
+		PIE_ROOT_CACHE="$XDG_CACHE_HOME/pie/roots"
+	elif [ "${HOME:-/nonexistent}" != /nonexistent ]; then
+		PIE_ROOT_CACHE="$HOME/.cache/pie/roots"
+	fi
+fi
 fixed=yes
 for v in $(compgen -e); do
 	case " PATH TMPDIR LC_ALL HOME PWD SHLVL OLDPWD _ PIE_FIXED $own " in *" $v "*) ;; *) fixed=no ;; esac
@@ -53,8 +64,20 @@ if [ $fixed = no ]; then
 	for v in PATH TMPDIR $own; do [ -z "${!v+x}" ] || keep+=("$v=${!v}"); done
 	exec env -i "${keep[@]}" LC_ALL=C.UTF-8 HOME=/nonexistent PIE_FIXED=1 bash -p "$(realpath "${BASH_SOURCE[0]}")" "$@"
 fi
-if [ $# -lt 3 ] || [ -z "$3" ]; then sed -n '4,/^trace_args=/{/^#/s/^# \{0,1\}//p}' "${BASH_SOURCE[0]}" >&2; exit 2; fi
-name=$2 root=$3 jobs=${4:-8}
+if [ $# -lt 2 ] || [ $# -gt 4 ] || [ -z "$1" ] || [ -z "$2" ]; then
+	echo "pie-prove: REPO and NAME are required" >&2
+	sed -n '4,/^trace_args=/{/^#/s/^# \{0,1\}//p}' "${BASH_SOURCE[0]}" >&2
+	exit 2
+fi
+name=$2 root=${3:-} jobs=${4:-8}
+if [[ "$root" =~ ^[0-9]+$ ]]; then
+	echo "pie-prove: a numeric CHROOT is ambiguous; use - JOBS for the default root" >&2
+	exit 2
+fi
+if ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+	echo "pie-prove: JOBS must be a positive integer" >&2
+	exit 2
+fi
 out=$(realpath -m "${PIE_OUT:-pie-out}")
 case $name in ''|[!A-Za-z0-9]*|*[!A-Za-z0-9.+_-]*) echo "pie-prove: NAME may have only letters, digits and ._+- and must start with a letter or digit: $name" >&2; exit 1 ;; esac
 [ "$out" != / ] || { echo "pie-prove: OUT may not be /" >&2; exit 1; }
@@ -66,6 +89,38 @@ fi
 rm -f "$report"
 repo=$(realpath "$1")
 tools=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+root_record="root: explicit $root"
+working_root='' copy_pid='' status=0
+cleanup_root() {
+	if [ -n "$copy_pid" ]; then
+		kill -TERM -- "-$copy_pid" 2>/dev/null || :
+		wait "$copy_pid" 2>/dev/null || :
+		copy_pid=
+	fi
+	if [ -n "$working_root" ]; then
+		unshare --map-auto --map-root-user rm -rf -- "$working_root"
+	fi
+}
+trap 'status=$?; cleanup_root || status=1; exit "$status"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+if [ -z "$root" ] || [ "$root" = - ]; then
+	if [ -n "${PIE_PROVE_RESUME:-}${PIE_PROVE_CHECK_ONLY:-}" ]; then
+		echo "pie-prove: default-root proofs cannot resume or check-only after their working copy is removed; use an explicit CHROOT" >&2
+		exit 2
+	fi
+	cached_root=$("$tools/pie-root" build)
+	root_hash=$("$tools/pie-root" hash)
+	root_record="root: recipe sha256:$root_hash"
+	working_root=$(mktemp -d "$(dirname "$(dirname "$cached_root")")/.proof-$root_hash-XXXXXXXX")
+	root=$working_root/root
+	setsid "$tools/pie-root" copy --destination "$working_root" >/dev/null &
+	copy_pid=$!
+	wait "$copy_pid"
+	copy_pid=
+	export PIE_UNSHARE=1
+fi
 [ -x "$root/usr/bin/dpkg-buildpackage" ] || { echo "pie-prove: CHROOT has no dpkg-buildpackage: $root" >&2; exit 1; }
 export GIT_NO_REPLACE_OBJECTS=1
 # PIE_TRACE_ARGS: more pie-trace options for both builds, only -d,
@@ -130,7 +185,7 @@ done
 mkdir -p "$out"
 # debian/ is read from HEAD, never from the working tree.
 hd=$(mktemp -d)
-trap 'rm -rf "$hd"' EXIT
+trap 'status=$?; rm -rf "$hd" || status=1; cleanup_root || status=1; exit "$status"' EXIT
 for f in changelog pie-leave-out pie-keep; do
 	if git -C "$repo" -c core.fsmonitor=false cat-file -e "HEAD:debian/$f" 2> /dev/null; then
 		git -C "$repo" cat-file blob "HEAD:debian/$f" > "$hd/$f"
@@ -223,7 +278,7 @@ stop_traces() {
 		[ -z "$pid" ] || wait "$pid" 2>/dev/null || :
 	done
 }
-trap 'stop_traces; rm -rf "$hd"' EXIT
+trap 'status=$?; stop_traces; rm -rf "$hd" || status=1; cleanup_root || status=1; exit "$status"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 if [ -n "$checkonly" ]; then
@@ -277,6 +332,7 @@ EOF
 fi
 {
 	echo "== $src $ver, commit $(cat "$out/$name-commit.txt" 2>/dev/null || echo unknown)${PIE_TRACE_ARGS:+, PIE_TRACE_ARGS: $PIE_TRACE_ARGS}"
+	printf '%s\n' "$root_record"
 	sed -n '2,3p;5p;8,9p' "$out/$name-tF.txt"
 	python3 -I - "$out/$name-tF" "$out/$name-tR" "$out/$name-F/${src}_$ver.dsc" "$out/$name-R/${src}_$ver.dsc" <<'EOF'
 import hashlib, json, os, sys

@@ -197,6 +197,12 @@ components and clean-matrix.
 Add a module with `main()` under `tools/pielib/commands/` to add a command.
 An underscore in a module name becomes a hyphen in the command name.
 
+Use `tools/pie prove REPO NAME [CHROOT] [JOBS]`. Omitted, empty or `-`
+CHROOT uses the cached recipe-built root. JOBS defaults to 8 and remains
+the fourth argument. Use `tools/pie prove REPO NAME - 4` for four jobs
+with the default root. A numeric third argument is refused as ambiguous.
+An explicit CHROOT keeps using that directory.
+
 Keep the whole `tools/` directory together. The entry points load `pielib`
 from beside themselves. The library uses Python's standard library and
 python3-debian. It shares the fixed environment, path traversal, DEP-5
@@ -234,6 +240,67 @@ Check-only and resume accept only traces that record private mounts on
 or resume. All pie-source steps use the fixed environment, including
 binary builds. DEP-5 escapes work in source filters, trace lists and
 allowed removals as they do in copyright files.
+
+### Recipe-built roots
+
+`tools/pie root build` builds or reuses the current recipe's root and prints
+its path. `tools/pie-root build` is the same command. `tools/pie root path`
+prints an existing completed root without building. `tools/pie root hash`
+prints the recipe hash. Build progress goes to standard error.
+
+The recipe is `tools/root-recipe/recipe.json`. It uses the Ubuntu snapshot
+at `20261028T020133Z`, exact native package versions, signed PIE sources
+and the public keyrings beside the recipe. It includes mount, util-linux,
+procps, strace and python3-debian. mmdebstrap first configures the essential
+packages, then installs the pinned include list. It registers darwin-arm64
+with dpkg. Device nodes are omitted. pie-trace binds the host's /dev before
+building. Ubuntu sources select amd64. The PIE ports source selects
+darwin-arm64. The installed pie-cross-deps resolves target build
+dependencies into its private cross-root during the proof.
+
+The hash covers canonical JSON of the recipe, the public keyring hashes
+and the bytes of the root builder and its entry points. Whitespace and JSON
+object key order do not affect it. Changing a pin, key or builder changes
+the cache key. The cache entry is
+`$XDG_CACHE_HOME/pie/roots/HASH`, or `~/.cache/pie/roots/HASH`.
+Its unpacked root is `HASH/root`; the recipe and completion records sit
+beside it. Set `PIE_ROOT_CACHE` to choose another cache directory.
+`PIE_ROOT_RECIPE` chooses another recipe file with its relative keyrings.
+The root command also accepts `--cache DIR`, `--recipe FILE` and
+`--tmpdir DIR`.
+
+Building needs mmdebstrap with unshare support, util-linux, uidmap, tar and xz,
+plus the shared Python dependencies. The user needs subordinate UID and
+GID mappings and permission to create user namespaces. On Ubuntu this may
+depend on the AppArmor profiles for mmdebstrap and unshare. Install the
+tools with `apt install mmdebstrap util-linux uidmap tar xz-utils python3-debian`.
+
+mmdebstrap stages its tarball and keys under `/var/tmp` by default.
+`PIE_ROOT_TMPDIR` selects another existing directory whose ancestors are
+world-traversable. This stage does not use TMPDIR. An inaccessible setting
+fails with a message naming PIE_ROOT_TMPDIR. The finished root is unpacked
+through profiled unshare with the invoking user mapped to root.
+The cache may be below a private home directory.
+
+The builder checks every pin, dpkg architectures, sources, keys and the
+installed recipe record. It builds in staging directories and publishes
+the completed entry with a rename. Concurrent builds of one hash take a
+lock. Existing entries with missing or mismatched completion records are
+refused. The command only cleans staging directories it created and never
+repairs, replaces or deletes an unknown root.
+
+With the default root, pie-prove enables unshare and writes
+`root: recipe sha256:HASH` in NAME-prove.txt. With an explicit directory it
+writes `root: explicit CHROOT`. Each default-root proof copies the cached
+root with `cp --archive --reflink=auto` into a unique `.proof-HASH-…`
+directory beside the cache entry. Profiled unshare maps the invoking user
+to root. Both traces use that working copy. Native dependencies, apt state
+and trace work stay in the copy. It is removed on success, failure,
+interrupt or termination. Per-run directories are never treated as
+completed cache entries. Proofs never write the cached root.
+
+Default-root proofs cannot use check-only or resume. Use an explicit
+CHROOT for these modes.
 
 ### Comparing packages and trees
 

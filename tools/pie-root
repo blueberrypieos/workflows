@@ -1,0 +1,11 @@
+#!/usr/bin/env -S python3 -I
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 The Blueberry Pie OS Authors
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from pielib.commands.root import main
+
+if __name__ == '__main__':
+    main()
