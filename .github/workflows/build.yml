@@ -1,13 +1,4 @@
 name: build
-
-# Builds a port's source package from its upstream tag and debian/, then its
-# binary packages from that source package alone, and uploads both as one
-# artifact, with contents: read only. attest.yml and release.yml publish
-# them, from jobs of their own that alone get write permissions.
-#
-# The source package keeps only the upstream files that debian/copyright's
-# Files-Excluded and Files-Included leave in, so a file left out cannot reach
-# the binary packages: the binary job never has the git checkout.
 on:
   workflow_call:
     inputs:
@@ -55,7 +46,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            git-buildpackage pristine-tar dpkg-dev devscripts lintian licenserecon xz-utils python3
+            git-buildpackage pristine-tar dpkg-dev devscripts lintian licenserecon xz-utils python3 python3-debian
 
       - name: "Checkout: all branches and tags, for the upstream tag"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

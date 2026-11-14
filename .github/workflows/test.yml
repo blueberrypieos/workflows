@@ -1,0 +1,24 @@
+name: test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-debian python3-pytest shellcheck dpkg-dev
+      - name: Tests
+        run: pytest-3
+      - name: Shell syntax and errors
+        run: |
+          bash -n tools/pie-prove tools/pie-clean-matrix
+          sh -n tools/pie-clean-matrix-cases
+          shellcheck --severity=error tools/pie-prove tools/pie-clean-matrix tools/pie-clean-matrix-cases

@@ -66,30 +66,13 @@ case $cm/ in */./*|*/../*|*//*) echo "pie-clean-matrix: WORKDIR may not have . o
 # No symlink may be on the way to WORKDIR, or rm -rf would follow it.
 cr=$(realpath -e -- $c) && [ "$(realpath -m -- $c$cm)" = "$cr$cm" ] || { echo "pie-clean-matrix: WORKDIR is reached through a symlink: $c$cm" >&2; exit 1; }
 # Nor may WORKDIR be on the way to REPO, DSC or a file beside DSC, links followed.
-python3 -I - "$cr$cm" $repo $(dirname $dsc) $dsc $(dirname $dsc)/* <<'EOF' || exit 1
+python3 -I - "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" "$cr$cm" "$repo" "$(dirname "$dsc")" "$dsc" "$(dirname "$dsc")"/* <<'EOF' || exit 1
 import os, sys
-top, paths = sys.argv[1], sys.argv[2:]
-def traversed(path):
-    out, cur, todo, hops = [], "/", [c for c in os.path.join(os.getcwd(), path).split("/") if c], 0
-    while todo:
-        c = todo.pop(0)
-        if c == ".":
-            continue
-        if c == "..":
-            cur = os.path.dirname(cur)
-            continue
-        e = os.path.join(cur, c)
-        out.append(e)
-        if os.path.islink(e) and hops < 40:
-            hops += 1
-            t = os.readlink(e)
-            todo = [x for x in t.split("/") if x] + todo
-            cur = "/" if t.startswith("/") else cur
-        else:
-            cur = e
-    return out
+sys.path.insert(0, sys.argv[1])
+from pielib.paths import traversed
+top, paths = sys.argv[2], sys.argv[3:]
 for p in paths:
-    for e in traversed(p):
+    for e in traversed(p, "pie-clean-matrix"):
         if e == top or e.startswith(top + "/"):
             sys.exit("pie-clean-matrix: WORKDIR holds %s, which is on the way to %s and would be removed" % (e, p))
 EOF

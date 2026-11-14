@@ -1,9 +1,9 @@
 #!/bin/bash -p
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2026 The Blueberry Pie OS Authors
-# usage: pie-prove REPO NAME [CHROOT] [JOBS]
+# usage: pie-prove REPO NAME CHROOT [JOBS]
 # NAME has only letters, digits and ._+- and starts with a letter or digit.
-# CHROOT is by default /srv/claude-basic-ports, and JOBS 8.
+# CHROOT is required. JOBS defaults to 8.
 # Builds REPO's HEAD as a full and as a reduced source package, builds the
 # binary packages of each from its .dsc under pie-trace in CHROOT, compares
 # them (pie-verify compare) and checks the reduced one (pie-verify check).
@@ -27,8 +27,8 @@
 # OUT is $PIE_OUT, by default ./pie-out. A run removes NAME-prove.txt first.
 # The traces build in CHROOT/work/trace-NAME@F and trace-NAME@R, which they
 # remove first, and mount them on CHROOT/work/trace-NAME, which they leave.
-# If the reduced build fails, pie-prove stops the full build's pie-trace. A
-# report that passes ends with "proof: passed".
+# If the reduced build fails, pie-prove stops both traces and their process
+# groups. A report that passes ends with "proof: passed".
 # A run that makes source packages, or takes them from PIE_PROVE_SOURCES,
 # first removes NAME-F, NAME-R, their logs, NAME-commit.txt, the traces
 # NAME-tF and NAME-tR, NAME-tF.txt, NAME-tR.txt and NAME-allow-missing.txt.
@@ -53,8 +53,8 @@ if [ $fixed = no ]; then
 	for v in PATH TMPDIR $own; do [ -z "${!v+x}" ] || keep+=("$v=${!v}"); done
 	exec env -i "${keep[@]}" LC_ALL=C.UTF-8 HOME=/nonexistent PIE_FIXED=1 bash -p "$(realpath "${BASH_SOURCE[0]}")" "$@"
 fi
-if [ $# -lt 2 ]; then sed -n '4,/^trace_args=/{/^#/s/^# \{0,1\}//p}' "${BASH_SOURCE[0]}" >&2; exit 2; fi
-name=$2 root=${3:-/srv/claude-basic-ports} jobs=${4:-8}
+if [ $# -lt 3 ] || [ -z "$3" ]; then sed -n '4,/^trace_args=/{/^#/s/^# \{0,1\}//p}' "${BASH_SOURCE[0]}" >&2; exit 2; fi
+name=$2 root=$3 jobs=${4:-8}
 out=$(realpath -m "${PIE_OUT:-pie-out}")
 case $name in ''|[!A-Za-z0-9]*|*[!A-Za-z0-9.+_-]*) echo "pie-prove: NAME may have only letters, digits and ._+- and must start with a letter or digit: $name" >&2; exit 1 ;; esac
 [ "$out" != / ] || { echo "pie-prove: OUT may not be /" >&2; exit 1; }
@@ -68,8 +68,9 @@ repo=$(realpath "$1")
 tools=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
 [ -x "$root/usr/bin/dpkg-buildpackage" ] || { echo "pie-prove: CHROOT has no dpkg-buildpackage: $root" >&2; exit 1; }
 export GIT_NO_REPLACE_OBJECTS=1
-# PIE_TRACE_ARGS: more pie-trace options for both builds, only -d, --map,
-# --scope, --arch and --build. The report's first line names them.
+# PIE_TRACE_ARGS: more pie-trace options for both builds, only -d,
+# --cross-deps, --map, --scope, --arch and --build. The report's first line
+# names them.
 # PIE_PROVE_SOURCES=PREFIX: use the source packages in PREFIX-F and
 # PREFIX-R, another proof's. Its PREFIX-commit.txt must name HEAD, as must
 # NAME-commit.txt of an earlier proof that is resumed or checked.
@@ -77,17 +78,19 @@ export GIT_NO_REPLACE_OBJECTS=1
 # analysis, comparison and checks. Both traces must be there.
 # PIE_PROVE_RESUME=1: keep NAME-F, NAME-R and NAME-tF if the full build's
 # trace is there, and go on from the reduced build.
+# Reused traces must record private mounts on /tmp, /var/tmp and /run.
+# Rebuild older traces without check-only or resume.
 set -f
 trace_args=(${PIE_TRACE_ARGS:-})
 set +f
 i=0
 while [ $i -lt ${#trace_args[@]} ]; do
 	case ${trace_args[$i]} in
-	-d|--map=?*|--scope=?*|--arch=?*|--build=?*) i=$((i + 1)) ;;
+	-d|--cross-deps|--map=?*|--scope=?*|--arch=?*|--build=?*) i=$((i + 1)) ;;
 	--map|--scope|--arch|--build)
 		[ $((i + 1)) -lt ${#trace_args[@]} ] || { echo "pie-prove: PIE_TRACE_ARGS: ${trace_args[$i]} needs a value" >&2; exit 1; }
 		i=$((i + 2)) ;;
-	*) echo "pie-prove: PIE_TRACE_ARGS may have only -d, --map, --scope, --arch and --build: ${trace_args[$i]}" >&2; exit 1 ;;
+	*) echo "pie-prove: PIE_TRACE_ARGS may have only -d, --cross-deps, --map, --scope, --arch and --build: ${trace_args[$i]}" >&2; exit 1 ;;
 	esac
 done
 # The proof is of HEAD. The tools read only HEAD; the working tree must match it too.
@@ -108,31 +111,14 @@ removed=("$out/$name-F" "$out/$name-R" "$out/$name-tF" "$out/$name-tR" "$out/$na
 	"$root/work/trace-$name@F" "$root/work/trace-$name@R")
 kept=("$1" "$repo" "$root" "$tools")
 [ -z "${PIE_PROVE_SOURCES:-}" ] || kept+=("$PIE_PROVE_SOURCES-F" "$PIE_PROVE_SOURCES-R" "$PIE_PROVE_SOURCES-commit.txt")
-python3 -I - "${removed[@]}" -- "${kept[@]}" <<'EOF' || exit 1
+python3 -I - "$tools" "${removed[@]}" -- "${kept[@]}" <<'EOF' || exit 1
 import os, sys
-a = sys.argv[1:]
+sys.path.insert(0, sys.argv[1])
+from pielib.paths import traversed
+a = sys.argv[2:]
 removed, kept = [os.path.realpath(p) for p in a[:a.index("--")]], a[a.index("--") + 1:]
-def traversed(path):
-    out, cur, todo, hops = [], "/", [c for c in os.path.join(os.getcwd(), path).split("/") if c], 0
-    while todo:
-        c = todo.pop(0)
-        if c == ".":
-            continue
-        if c == "..":
-            cur = os.path.dirname(cur)
-            continue
-        e = os.path.join(cur, c)
-        out.append(e)
-        if os.path.islink(e) and hops < 40:
-            hops += 1
-            t = os.readlink(e)
-            todo = [x for x in t.split("/") if x] + todo
-            cur = "/" if t.startswith("/") else cur
-        else:
-            cur = e
-    return out
 for k in kept:
-    for e in traversed(k):
+    for e in traversed(k, "pie-prove"):
         for r in removed:
             if e == r or e.startswith(r + "/"):
                 sys.exit("pie-prove: %s is on the way to %s, and the run removes or writes %s" % (e, k, r))
@@ -215,23 +201,48 @@ if [ -n "$resume" ] && [ "$(cat "$out/$name-commit.txt" 2>/dev/null)" != "$head"
 	echo "pie-prove: the earlier proof in $out is not of HEAD" >&2
 	exit 1
 fi
+if [ -n "$resume" ]; then
+	reused=("$out/$name-tF")
+	[ -z "$checkonly" ] || reused+=("$out/$name-tR")
+	python3 -I - "$tools" "${reused[@]}" <<'EOF' || exit 1
+import sys
+sys.path.insert(0, sys.argv[1])
+from pielib.proof import require_private_tmpfs
+require_private_tmpfs(sys.argv[2:])
+EOF
+fi
 # The full and the reduced build run at once, each in a slot of its own
 # (the same path in the chroot).
 fpid=
+rpid=
+stop_traces() {
+	for pid in "$fpid" "$rpid"; do
+		[ -z "$pid" ] || kill -TERM -- "-$pid" 2>/dev/null || :
+	done
+	for pid in "$fpid" "$rpid"; do
+		[ -z "$pid" ] || wait "$pid" 2>/dev/null || :
+	done
+}
+trap 'stop_traces; rm -rf "$hd"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if [ -n "$checkonly" ]; then
 	rm -f "$out/$name-tR.txt"
 	"$tools/pie-trace" --analyse "$out/$name-tR" "${trace_args[@]}" > "$out/$name-tR.txt"
 elif [ -z "$resume" ]; then
 	rm -f "$out/$name-tF.txt"
-	"$tools/pie-trace" --chroot "$root" "$out/$name-F/${src}_$ver.dsc" "$out/$name-tF" -j "$jobs" --name "$name" --full "${leave[@]}" "${trace_args[@]}" --slot F > "$out/$name-tF.txt" &
+	setsid "$tools/pie-trace" --chroot "$root" "$out/$name-F/${src}_$ver.dsc" "$out/$name-tF" -j "$jobs" --name "$name" --full "${leave[@]}" "${trace_args[@]}" --slot F > "$out/$name-tF.txt" &
 	fpid=$!
 fi
 [ -n "$checkonly" ] || rm -f "$out/$name-tR.txt"
-if [ -z "$checkonly" ] && ! "$tools/pie-trace" --chroot "$root" "$out/$name-R/${src}_$ver.dsc" "$out/$name-tR" -j "$jobs" --name "$name" "${trace_args[@]}" --slot R > "$out/$name-tR.txt"; then
-	[ -z "$fpid" ] || kill "$fpid"
-	exit 1
+if [ -z "$checkonly" ]; then
+	setsid "$tools/pie-trace" --chroot "$root" "$out/$name-R/${src}_$ver.dsc" "$out/$name-tR" -j "$jobs" --name "$name" "${trace_args[@]}" --slot R > "$out/$name-tR.txt" &
+	rpid=$!
+	wait "$rpid" || exit 1
+	rpid=
 fi
 [ -z "$fpid" ] || wait "$fpid"
+fpid=
 if [ -n "$resume" ]; then
 	# The full build's trace is an earlier run's: analyse it with the current options.
 	rm -f "$out/$name-tF.txt"

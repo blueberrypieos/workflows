@@ -1,11 +1,4 @@
 name: attest
-
-# Signs the build provenance of build.yml's packages, which users check with
-# gh attestation verify FILE --repo OWNER/REPO \
-#   --signer-workflow blueberrypieos/workflows/.github/workflows/attest.yml
-# The calling job must grant contents: read, id-token: write, attestations:
-# write and artifact-metadata: write, and run only on a push of the default
-# branch or of a tag.
 on:
   workflow_call:
     inputs:

@@ -107,7 +107,8 @@ gh attestation verify FILE --repo OWNER/REPO \
 
 `release.yml` publishes them as the tag's GitHub release.
 
-The workflow does not run tests.
+The reusable build workflow does not run tests. The test workflow checks
+this repository on pushes and pull requests.
 
 
 ### Ports that build against other ports
@@ -187,3 +188,140 @@ tag that commit with that version. A packaging
 repository that needs the new toolchain moves to the new tag and raises its
 `Build-Depends: pietoolchain (>= VERSION)`. The others can stay on the tag
 they use.
+
+## Proof tools
+
+Run `tools/pie --help` to list the commands. `tools/pie source ARGS` runs
+`pie-source ARGS`. The same applies to trace, prove, verify, copyright,
+components and clean-matrix.
+Add a module with `main()` under `tools/pielib/commands/` to add a command.
+An underscore in a module name becomes a hyphen in the command name.
+
+Keep the whole `tools/` directory together. The entry points load `pielib`
+from beside themselves. The library uses Python's standard library and
+python3-debian. It shares the fixed environment, path traversal, DEP-5
+matching and copyright merging. Source filters match directories as well as
+files.
+DEP-5 editing keeps raw paragraphs so licence texts and formatting survive.
+Debian control and source metadata use python-debian. The shell entry
+points start with bash -p and set their own environment.
+Only `pie-clean-matrix-cases` is copied into a chroot. It is standalone.
+
+Run `pytest-3` from this checkout. Tests need python3-pytest and
+python3-debian. The push and pull request workflow also checks shell syntax
+and shellcheck errors.
+
+Run `pytest-3 tests/test_sdk_parity.py --pietoolchain=/path/to/pietoolchain`
+to check the SDK's independent copyright merge against pielib. It
+compares matching, merge placement, rendered paragraphs and effective file
+coverage across 300 fixed-seed cases.
+
+The clean matrix cases can run on a host with the SDK installed:
+`pytest-3 tests/test_clean_matrix.py --clean-matrix-dsc=/path/to/source.dsc`.
+The source package must use the SDK's rules.mk and have no other .dsc beside
+it. The runner uses a fresh directory under /tmp. Its checks for unsafe
+runner paths run without the SDK. The full cases are skipped unless given
+a source package. Run the chroot matrix separately.
+
+Each build mounts a fresh tmpfs on /tmp, /var/tmp and /run. Verification
+also counts reads under /var/tmp and /run.
+Each trace runs in its own process group. Failure and signals terminate
+both groups and wait for the traces. Successful traces require a nonempty
+set of debs matching the build's .changes names, sizes and SHA-256 values.
+Trace metadata records the expected names.
+Check-only and resume accept only traces that record private mounts on
+/tmp, /var/tmp and /run. Rebuild a trace that doesn't, without check-only
+or resume. All pie-source steps use the fixed environment, including
+binary builds. DEP-5 escapes work in source filters, trace lists and
+allowed removals as they do in copyright files.
+
+### Comparing packages and trees
+
+Use `tools/pie compare OLD NEW --mode bytes|package|tree [--out DIR] [--json]`.
+Exit status is 0 for identical inputs, 1 for differences and 2 for invalid
+input, a resource failure or a failed diagnostic tool. `--out` names a
+directory. It gets `summary.txt` and the full `report.json`. Standard output
+contains the text summary. Use `--json` for the full JSON report instead.
+The formats are never mixed. Existing reports and diagnostic log directories
+are refused. Other files are kept. Non-UTF-8 deb filenames are an input error.
+
+`bytes` is the acceptance check. Inputs are two debs or directories of debs.
+Each input must have at least one deb. The command requires the same set
+of `.deb` filenames and the same SHA-256 for every file. It lists missing,
+extra and different debs. It ignores no bytes or control fields. Other
+files in the directories are outside this check.
+Both archives of every deb are validated, including identical and unpaired
+debs. The archive reader is shared with pie-verify. It rejects duplicate
+member names and hard links without a preceding regular file as their
+target. Bad headers and non-zero bytes after the tar end marker are errors.
+Both commands use the same SHA-256 file hashing helper. Verification retains
+raw member names and uses its original key spelling for allowed removals.
+
+`package` diagnoses differences. Directory inputs are paired by Package
+and Architecture, even across versions. More than one deb with the same
+identity on either side is an error. Two explicit debs are compared
+directly, including differences in Package and Architecture. Unpaired
+packages are listed with their complete inventories.
+
+Each package is copied into a fresh private directory before validation.
+Only control files are unpacked. Their paths must be relative and contain
+no `..` component. Control members must be regular files or the root
+directory. Control links are refused. Data inventories are read from the
+tar stream without writing files or following links. Absolute and relative
+link targets are recorded as metadata. Nothing is skipped. Diagnostics run
+only on the validated deb copies. They never receive an unpacked tree.
+The report records the original paths and the temporary validated paths.
+Temporary copies are removed after the comparison. File hashes are streamed.
+An input or resource failure gets status 2 and an error report when `--out`
+is given. Errors identify the original deb path.
+
+The report contains every control field and its old and new values when
+it differs. It includes the raw control text and both control and data
+archive inventories. Each member lists its type, mode, numeric and named
+owners, link target, timestamp, device numbers and extended headers. Raw
+member names and positions preserve differences in spelling and order.
+Regular files and hard links have a size and SHA-256. Other entries have
+no file hash. Every member difference is listed, including timestamp and
+maintainer script changes. Differences in archive bytes are reported even
+when the decoded members match. The ar inventory gives every member's
+name, position, size, SHA-256, raw header and padding. It shows extra members
+and changes in compression. Filename changes are differences too. The
+summary names up to 20 changed members per archive. Complete lists remain
+in the report. Any byte difference without an itemised explanation is
+explicitly reported.
+
+For each different pair, the full report includes `debdiff` with directory
+and all control file comparisons, and `diffoscope --text` when installed.
+diffoscope compares the whole deb so it can describe differing files and
+archive structure. `--force-details` prevents matching stale md5sums from
+hiding file content differences. Its default output limits are disabled.
+Tool output, errors and exit status are retained. The summary gives only
+the last error line when a diagnostic fails. With `--out`, complete stderr
+is also saved in `diagnostics/NNN-TOOL.log`. Full stderr remains in the JSON.
+A missing diffoscope is stated in the summary and report. A missing
+debdiff or a failed diagnostic is an error.
+These tools' own comparison rules never filter the inventories or the
+control field report. Package diagnosis does not replace byte acceptance.
+The commands need dpkg-deb and debdiff in addition to the shared Python
+dependencies. diffoscope is optional.
+
+`tree` shows git tree IDs and `git diff --stat --summary`. Give it two refs or tree
+IDs from the current repository, or two directories. Directories are
+snapshots of their current contents, including ignored and untracked
+files. All `.git` entries and empty directories are omitted. Git records
+file contents, executable modes and symlink targets, with no ownership or
+timestamp metadata. Special files are rejected. The temporary object
+database stays outside the inputs. No index or ref is written in an input
+repository. Directory snapshots hash file bytes without git filters in one
+`git hash-object --stdin-paths --no-filters` call for both inputs. Mode-only
+changes appear in the diff summary.
+
+Examples:
+
+```sh
+tools/pie compare full/debs reduced/debs --mode bytes --out compare-bytes
+tools/pie compare old.deb new.deb --mode package --out compare-package
+tools/pie compare HEAD~ HEAD --mode tree --out compare-tree
+tools/pie compare old-tree new-tree --mode tree
+tools/pie compare old.deb new.deb --mode package --json
+```

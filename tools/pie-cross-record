@@ -1,0 +1,121 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 The Blueberry Pie OS Authors
+"""usage: pie-cross-record HELPER SOURCE EVIDENCE
+
+Run the installed dependency resolver with a retained temporary directory.
+Save its apt status and the actual downloaded or cached target archives.
+Run inside the build's dependency lock, before compilation.
+"""
+from email.parser import Parser
+import hashlib
+import json
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+class TemporaryFiles:
+    def __init__(self, root):
+        self.root = root
+        self.path = None
+
+    def mkdtemp(self):
+        if self.path is not None:
+            raise ValueError('dependency resolver allocated more than one state directory')
+        self.path = Path(tempfile.mkdtemp(dir=self.root))
+        return str(self.path)
+
+    def __getattr__(self, name):
+        return getattr(tempfile, name)
+
+
+class RetainedFiles:
+    def __init__(self, temporary):
+        self.temporary = temporary
+
+    def rmtree(self, path, *args, **kwargs):
+        if self.temporary.path is None or Path(path) != self.temporary.path:
+            shutil.rmtree(path, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(shutil, name)
+
+
+def identity(path):
+    result = subprocess.run(['dpkg-deb', '--show', '--showformat=${Package}\t${Version}\t${Architecture}\n',
+                             str(path)], check=True, capture_output=True, text=True)
+    fields = result.stdout.rstrip('\n').split('\t')
+    if len(fields) != 3 or not all(fields):
+        raise ValueError('archive has no package identity: ' + str(path))
+    return tuple(fields)
+
+
+def digest(path):
+    with path.open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def capture(state, evidence, cache=Path('/var/cache/apt/archives')):
+    status = state / 'status'
+    installed = set()
+    for paragraph in status.read_text().strip().split('\n\n'):
+        package = Parser().parsestr(paragraph)
+        if package.get('Architecture') == 'darwin-arm64' and package.get('Status') == 'install ok installed':
+            installed.add(tuple(package[key] for key in ('Package', 'Version', 'Architecture')))
+    archives = {}
+    for path in sorted(state.glob('*.deb')):
+        key = identity(path)
+        if key in archives:
+            raise ValueError('duplicate downloaded package: ' + key[0])
+        archives[key] = (path, 'download')
+    available = {}
+    if installed:
+        for path in sorted(cache.glob('*.deb')):
+            key = identity(path)
+            if key in installed:
+                available.setdefault(key, []).append(path)
+    for key in sorted(installed):
+        candidates = available.get(key, [])
+        if key in archives:
+            candidates.append(archives[key][0])
+        if not candidates or len({digest(path) for path in candidates}) != 1:
+            raise ValueError('installed target provider needs a unique cached archive: ' + key[0])
+        if key not in archives:
+            archives[key] = (candidates[0], 'installed')
+    evidence.mkdir()
+    (evidence / 'archives').mkdir()
+    shutil.copyfile(status, evidence / 'status')
+    records = []
+    for key, (path, origin) in sorted(archives.items()):
+        sha = digest(path)
+        filename = sha + '.deb'
+        target = evidence / 'archives' / filename
+        shutil.copyfile(path, target)
+        if digest(target) != sha:
+            raise ValueError('dependency archive changed during capture: ' + str(path))
+        records.append(dict(zip(('package', 'version', 'architecture'), key),
+                            sha256=sha, archive=filename, origin=origin))
+    (evidence / 'receipt.json').write_text(json.dumps({'schema': 1, 'status_sha256': digest(status),
+                                                      'packages': records}, indent=2) + '\n')
+
+
+def main():
+    helper, source, output = map(Path, sys.argv[1:])
+    namespace = runpy.run_path(str(helper))['main'].__globals__
+    with tempfile.TemporaryDirectory(dir=output.parent) as scratch:
+        temporary = TemporaryFiles(scratch)
+        namespace['tempfile'] = temporary
+        namespace['shutil'] = RetainedFiles(temporary)
+        sys.argv = [str(helper), str(source)]
+        namespace['main']()
+        if temporary.path is None:
+            raise ValueError('dependency resolver did not retain its apt state')
+        capture(temporary.path, output)
+
+
+if __name__ == '__main__':
+    main()

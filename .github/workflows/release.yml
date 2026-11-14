@@ -1,10 +1,4 @@
 name: release
-
-# Publishes build.yml's packages as the pushed tag's GitHub release
-# (build.yml has checked that the tag is debian/changelog's version's).
-# The calling job must grant contents: write and run only on a tag push; the
-# job runs in the repository's release environment, whose protection rules
-# can require approval and limit which tags may release.
 on:
   workflow_call:
     inputs:
