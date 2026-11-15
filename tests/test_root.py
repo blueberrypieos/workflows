@@ -195,10 +195,10 @@ def test_fixed_proof_home_keeps_account_cache_default(tmp_path, monkeypatch):
 def test_recipe_contains_required_tooling_and_archives():
     recipe = root.Recipe(root.DEFAULT_RECIPE)
     pins = {p['package']: p['version'] for p in recipe.data['packages']}
-    for name in ('mount', 'util-linux', 'procps', 'strace', 'python3-debian', 'pietoolchain', 'pietoolchain-sdk'):
+    for name in ('mount', 'util-linux', 'procps', 'strace', 'python3-debian', 'pietoolchain', 'pietoolchain-host', 'pietoolchain-sdk'):
         assert name in pins
     assert pins['mount'] == pins['util-linux']
-    assert pins['pietoolchain'] == pins['pietoolchain-sdk'] == '0.2.0'
+    assert pins['pietoolchain'] == pins['pietoolchain-host'] == pins['pietoolchain-sdk'] == '0.3.0'
     command = root.bootstrap_command(recipe, Path('/var/tmp/root-stage'))
     for line in command:
         if line.startswith('deb '):

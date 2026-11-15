@@ -26,10 +26,11 @@ env:
   # This file is released only as this tag, and tags never move: the source
   # job takes tools/ from the same tag.
   WORKFLOWS_REF: v2
-  # pietoolchain's release holds both pietoolchain and pietoolchain-sdk.
-  PIETOOLCHAIN_VERSION: '0.2.0'
-  PIETOOLCHAIN_SHA256: 495ced992885c4717bcb468607d473934aef74046d82dd54bae36777942f4c63
-  PIETOOLCHAIN_SDK_SHA256: 65568a3a247c9f457c9360342a2eeb74535e579e08a14a2933ca5d99ca89a709
+  PIETOOLCHAIN_HOST_VERSION: '0.3.0'
+  PIETOOLCHAIN_HOST_SHA256: 8d65a1bc7ef483a033af0f7657007a0d38f61f1480b418858dca32380a3e9095
+  PIETOOLCHAIN_SHA256: 040a41715505af79382d93c3e63b2dbe2d8dfd4caee3c76db06ba07ca9bfc04a
+  PIETOOLCHAIN_SDK_VERSION: '0.3.0'
+  PIETOOLCHAIN_SDK_SHA256: be67603f105be380b9d26d1955d46bf92eb455dbf6e81fb281311377eb7e72d7
 
 permissions:
   contents: read
@@ -130,18 +131,22 @@ jobs:
           persist-credentials: false
           sparse-checkout: tools/
 
-      - name: pietoolchain and pietoolchain-sdk
+      - name: pietoolchain-host, pietoolchain and pietoolchain-sdk
         run: |
           github=https://github.com/blueberrypieos
-          tc="pietoolchain_${PIETOOLCHAIN_VERSION}_amd64.deb"
-          sdk="pietoolchain-sdk_${PIETOOLCHAIN_VERSION}_all.deb"
+          host="pietoolchain-host_${PIETOOLCHAIN_HOST_VERSION}_amd64.deb"
+          tc="pietoolchain_${PIETOOLCHAIN_HOST_VERSION}_all.deb"
+          sdk="pietoolchain-sdk_${PIETOOLCHAIN_SDK_VERSION}_all.deb"
+          curl -fsSL --retry 3 -o "/tmp/$host" \
+            "$github/pietoolchain-host/releases/download/$PIETOOLCHAIN_HOST_VERSION/$host"
           curl -fsSL --retry 3 -o "/tmp/$tc" \
-            "$github/pietoolchain/releases/download/$PIETOOLCHAIN_VERSION/$tc"
+            "$github/pietoolchain-host/releases/download/$PIETOOLCHAIN_HOST_VERSION/$tc"
           curl -fsSL --retry 3 -o "/tmp/$sdk" \
-            "$github/pietoolchain/releases/download/$PIETOOLCHAIN_VERSION/$sdk"
-          printf '%s  %s\n' "$PIETOOLCHAIN_SHA256" "/tmp/$tc" \
+            "$github/pietoolchain/releases/download/$PIETOOLCHAIN_SDK_VERSION/$sdk"
+          printf '%s  %s\n' "$PIETOOLCHAIN_HOST_SHA256" "/tmp/$host" \
+            "$PIETOOLCHAIN_SHA256" "/tmp/$tc" \
             "$PIETOOLCHAIN_SDK_SHA256" "/tmp/$sdk" | sha256sum -c -
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "/tmp/$tc" "/tmp/$sdk"
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "/tmp/$host" "/tmp/$tc" "/tmp/$sdk"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

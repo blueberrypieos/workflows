@@ -79,8 +79,9 @@ The `binary` job runs in a new `ubuntu:26.04` container. It checks out only
 this repository's tools, never the packaging repository:
 
 1. checks out this repository's tools into `.workflows`;
-2. downloads pietoolchain and pietoolchain-sdk from the pietoolchain
-   release it pins, checks their SHA-256 hashes and installs them;
+2. downloads pietoolchain-host and pietoolchain from the pietoolchain-host
+   release it pins, and pietoolchain-sdk from the pietoolchain release it
+   pins, checks their SHA-256 hashes and installs them;
 3. extracts the source package with `dpkg-source -x`;
 4. installs the build dependencies (`apt-get build-dep`);
 5. builds the binary packages from the extracted source alone:
@@ -180,11 +181,14 @@ library and its `-dev` package.
 
 ## Updating pietoolchain
 
-pietoolchain's releases are on blueberrypieos/pietoolchain. A tag is the
-version (`0.1.0`), and its CI builds and releases both
-`pietoolchain_VERSION_amd64.deb` and `pietoolchain-sdk_VERSION_all.deb`.
-To move to a new release, update `PIETOOLCHAIN_VERSION` and the two
-SHA-256s in `build.yml` (the release assets'), set `WORKFLOWS_REF` in
+The host tools are released on blueberrypieos/pietoolchain-host, as
+`pietoolchain-host_VERSION_amd64.deb` and the transitional
+`pietoolchain_VERSION_all.deb`. The SDK is released on
+blueberrypieos/pietoolchain, as `pietoolchain-sdk_VERSION_all.deb`. A tag is
+the version (`0.3.0`). To move to a new release, update
+`PIETOOLCHAIN_HOST_VERSION` or `PIETOOLCHAIN_SDK_VERSION` and the matching
+SHA-256s in `build.yml` (the release assets'), update the same pins in
+`tools/root-recipe/recipe.json`, set `WORKFLOWS_REF` in
 `build.yml` to the next version (`v1.1`, `v2`, ...), merge the change, and
 tag that commit with that version. A packaging
 repository that needs the new toolchain moves to the new tag and raises its
