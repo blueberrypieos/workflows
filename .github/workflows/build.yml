@@ -25,7 +25,7 @@ on:
 env:
   # This file is released only as this tag, and tags never move: the source
   # job takes tools/ from the same tag.
-  WORKFLOWS_REF: v3
+  WORKFLOWS_REF: v4
   PIETOOLCHAIN_HOST_VERSION: '0.3.0'
   PIETOOLCHAIN_HOST_SHA256: 8d65a1bc7ef483a033af0f7657007a0d38f61f1480b418858dca32380a3e9095
   PIETOOLCHAIN_SHA256: 040a41715505af79382d93c3e63b2dbe2d8dfd4caee3c76db06ba07ca9bfc04a
@@ -54,6 +54,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Submodules
+        run: git submodule update --init --recursive --depth 1 --jobs 8
 
       - name: The workflows' tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

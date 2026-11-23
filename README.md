@@ -18,7 +18,7 @@ permissions:
   contents: read
 jobs:
   build:
-    uses: blueberrypieos/workflows/.github/workflows/build.yml@v1
+    uses: blueberrypieos/workflows/.github/workflows/build.yml@v4
   attest:
     needs: build
     if: >-
@@ -30,7 +30,7 @@ jobs:
       id-token: write
       attestations: write
       artifact-metadata: write
-    uses: blueberrypieos/workflows/.github/workflows/attest.yml@v1
+    uses: blueberrypieos/workflows/.github/workflows/attest.yml@v4
     with:
       artifact: ${{ needs.build.outputs.artifact }}
   release:
@@ -38,7 +38,7 @@ jobs:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     permissions:
       contents: write
-    uses: blueberrypieos/workflows/.github/workflows/release.yml@v1
+    uses: blueberrypieos/workflows/.github/workflows/release.yml@v4
     with:
       artifact: ${{ needs.build.outputs.artifact }}
 ```
@@ -60,7 +60,9 @@ The `source` job:
 
 1. on a tag, checks that it is the changelog version's package tag, and
    stops otherwise;
-2. makes the source package with `tools/pie-source source`:
+2. checks out pinned submodules recursively with shallow history, while
+   retaining the parent repository's full history and tags, then makes the
+   source package with `tools/pie-source source`:
    - the orig tarball comes from the upstream tag (`upstream-tag` in
      `debian/gbp.conf`; a `+dsN` version uses the tag of the version
      without the suffix), or from the `pristine-tar` branch when
@@ -120,7 +122,7 @@ A port whose Build-Depends name other ports' `-dev` packages passes the
 ports' apt repository to its `build` job:
 
 ```yaml
-    uses: blueberrypieos/workflows/.github/workflows/build.yml@v1
+    uses: blueberrypieos/workflows/.github/workflows/build.yml@v4
     with:
       ports-repository: https://example.org/debian blueberry-pie-os
       ports-keyring-url: https://example.org/debian/repository.key
