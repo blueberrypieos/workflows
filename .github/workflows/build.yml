@@ -25,11 +25,11 @@ on:
 env:
   # This file is released only as this tag, and tags never move: the source
   # job takes tools/ from the same tag.
-  WORKFLOWS_REF: v5
+  WORKFLOWS_REF: v6
   PIETOOLCHAIN_HOST_VERSION: '0.3.2'
   PIETOOLCHAIN_HOST_SHA256: 1ad4021ce3d0299d1dfc988a262f1b28a8d9df1bd4e72c4b46a848eacd39df3d
-  PIETOOLCHAIN_SDK_VERSION: '0.3.0'
-  PIETOOLCHAIN_SDK_SHA256: be67603f105be380b9d26d1955d46bf92eb455dbf6e81fb281311377eb7e72d7
+  PIETOOLCHAIN_SDK_VERSION: '0.3.1'
+  PIETOOLCHAIN_SDK_SHA256: 4eae971183fc58c4d3da4b4defc089bd1f4ba18508c6eb0e1e07333002d3e274
 
 permissions:
   contents: read
