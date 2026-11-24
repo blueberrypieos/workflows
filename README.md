@@ -81,9 +81,9 @@ The `binary` job runs in a new `ubuntu:26.04` container. It checks out only
 this repository's tools, never the packaging repository:
 
 1. checks out this repository's tools into `.workflows`;
-2. downloads pietoolchain-host and pietoolchain from the pietoolchain-host
-   release it pins, and pietoolchain-sdk from the pietoolchain release it
-   pins, checks their SHA-256 hashes and installs them;
+2. downloads pietoolchain-host from the pietoolchain-host release it pins,
+   and pietoolchain-sdk from the pietoolchain release it pins, checks their
+   SHA-256 hashes and installs them;
 3. extracts the source package with `dpkg-source -x`;
 4. installs the build dependencies (`apt-get build-dep`);
 5. builds the binary packages from the extracted source alone:
@@ -140,7 +140,8 @@ The ports' `Depends` on core's libraries resolve against pietoolchain-sdk,
 which provides core's runtime packages at the versions it was built with.
 Build tools in Build-Depends must be `Multi-Arch: foreign`,
 `Architecture: all` or `:native`, and the port needs
-`Build-Depends: pietoolchain (>= 0.1.0)`, for `pie-cross-deps`.
+`Build-Depends: pietoolchain-host (>= 0.3.0), pietoolchain-sdk (>= 0.2.0)`,
+for `pie-cross-deps`.
 
 ## What a packaging repository contains
 
@@ -151,7 +152,8 @@ tags. The `blueberry-pie-os/latest` branch has that tree plus:
   (`upstream-branch`, `upstream-tag`,
   `debian-branch = blueberry-pie-os/latest`,
   `debian-tag = blueberry-pie-os/%(version)s`).
-- `debian/control`, with `Build-Depends: pietoolchain (>= VERSION)` (plus
+- `debian/control`, with `Build-Depends: pietoolchain-host (>= VERSION),
+  pietoolchain-sdk (>= VERSION)` (plus
   any host tools the port needs) and its binary packages, each with
   `Architecture: darwin-arm64`. With more than one, each after the first
   has a `debian/PACKAGE.files` naming the files it takes (a library's
@@ -184,8 +186,7 @@ library and its `-dev` package.
 ## Updating pietoolchain
 
 The host tools are released on blueberrypieos/pietoolchain-host, as
-`pietoolchain-host_VERSION_amd64.deb` and the transitional
-`pietoolchain_VERSION_all.deb`. The SDK is released on
+`pietoolchain-host_VERSION_amd64.deb`. The SDK is released on
 blueberrypieos/pietoolchain, as `pietoolchain-sdk_VERSION_all.deb`. A tag is
 the version (`0.3.0`). To move to a new release, update
 `PIETOOLCHAIN_HOST_VERSION` or `PIETOOLCHAIN_SDK_VERSION` and the matching
@@ -194,8 +195,8 @@ SHA-256s in `build.yml` (the release assets'), update the same pins in
 `build.yml` to the next version (`v1.1`, `v2`, ...), merge the change, and
 tag that commit with that version. A packaging
 repository that needs the new toolchain moves to the new tag and raises its
-`Build-Depends: pietoolchain (>= VERSION)`. The others can stay on the tag
-they use.
+`Build-Depends` on pietoolchain-host or pietoolchain-sdk. The others can
+stay on the tag they use.
 
 ## Proof tools
 

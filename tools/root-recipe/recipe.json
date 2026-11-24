@@ -1381,14 +1381,9 @@
       "version": "7build4"
     },
     {
-      "package": "pietoolchain",
-      "architecture": "all",
-      "version": "0.3.0"
-    },
-    {
       "package": "pietoolchain-host",
       "architecture": "amd64",
-      "version": "0.3.0"
+      "version": "0.3.2"
     },
     {
       "package": "pietoolchain-sdk",
