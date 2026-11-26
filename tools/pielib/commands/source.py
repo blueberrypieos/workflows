@@ -200,7 +200,7 @@ def make_orig(repo, out, full):
             stanza = "Files-Excluded-" + comp if comp else "Files-Excluded"
             if filtered and stanza in fields:
                 res = subprocess.run(["mk-origtargz", "--package", src, "--version", upver, "--compression", "xz",
-                                      "--copyright-file", os.path.join(head_debian(repo), "copyright"),
+                                      "--copyright-file", os.path.join(head_debian(repo), "copyright"), "--repack",
                                       "--directory", tmp, "--copy"] + (["--component", comp] if comp else []) + [tar],
                                      cwd=os.path.dirname(head_debian(repo)), capture_output=True, text=True)
                 log = res.stdout + res.stderr

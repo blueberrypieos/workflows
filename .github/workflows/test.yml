@@ -14,7 +14,8 @@ jobs:
       - name: Test packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-debian python3-pytest shellcheck dpkg-dev
+          sudo apt-get install -y --no-install-recommends python3-debian python3-pytest shellcheck dpkg-dev \
+            devscripts git-buildpackage
       - name: Tests
         run: pytest-3
       - name: Shell syntax and errors
