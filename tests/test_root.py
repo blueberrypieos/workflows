@@ -200,7 +200,7 @@ def test_recipe_contains_required_tooling_and_archives():
     assert pins['mount'] == pins['util-linux']
     assert 'pietoolchain' not in pins
     assert pins['pietoolchain-host'] == '0.3.2'
-    assert pins['pietoolchain-sdk'] == '0.3.1'
+    assert pins['pietoolchain-sdk'] == '0.3.2'
     command = root.bootstrap_command(recipe, Path('/var/tmp/root-stage'))
     for line in command:
         if line.startswith('deb '):
