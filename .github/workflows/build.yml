@@ -23,8 +23,6 @@ on:
         value: ${{ jobs.binary.outputs.artifact }}
 
 env:
-  # This file is released only as this tag, and tags never move: the source
-  # job takes tools/ from the same tag.
   WORKFLOWS_REF: v7
   PIETOOLCHAIN_HOST_VERSION: '0.3.2'
   PIETOOLCHAIN_HOST_SHA256: 1ad4021ce3d0299d1dfc988a262f1b28a8d9df1bd4e72c4b46a848eacd39df3d

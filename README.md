@@ -68,7 +68,9 @@ The `source` job:
      without the suffix), or from the `pristine-tar` branch when
      `debian/gbp.conf` sets `pristine-tar = True`;
    - it keeps only the files that `debian/copyright`'s `Files-Excluded`
-     and `Files-Included` leave in, as `mk-origtargz` does;
+     and `Files-Included` leave in, as `mk-origtargz` does, and each
+     component's tarball only those that its `Files-Excluded-COMPONENT`
+     and `Files-Included-COMPONENT` leave in;
    - `debian/` comes from the commit being built, and nothing else may
      differ from the upstream tag;
 3. checks the source package with `tools/pie-verify check`: lintian's

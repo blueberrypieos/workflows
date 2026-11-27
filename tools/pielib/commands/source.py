@@ -10,7 +10,11 @@ orig    Makes the upstream tarball for debian/changelog's version from the
         Files-Included leave in, as mk-origtargz does. Each component in
         gbp.conf gets its own tarball from its directory of the upstream
         tree, filtered by Files-Excluded-COMPONENT and
-        Files-Included-COMPONENT.
+        Files-Included-COMPONENT. When one tarball has its Files-Excluded
+        field, each must have one, and the version needs a +dsN suffix. A
+        +dsN version needs those fields. A Files-Included field needs its
+        Files-Excluded field. A field for a component must name one in
+        gbp.conf. Field names match in any case. --full skips these checks.
 source  Makes the source package from that tarball and HEAD's debian/. For
         a 3.0 (native) package, the tree is HEAD plus each submodule at the
         commit HEAD records, less what Files-Excluded and Files-Included
@@ -172,15 +176,29 @@ def make_orig(repo, out, full):
     upver = upstream_version(version)
     base = re.sub(r"\+ds\d*$", "", upver)
     tag, commit = upstream_commit(repo, base)
-    fields = header(repo)
-    filtered = not full and "Files-Excluded" in fields
+    names = list(header(repo))
+    fields = {name.lower() for name in names}
+    comps = components(repo)
+    lower_comps = [comp.lower() for comp in comps]
+    stanzas = ["Files-Excluded" + ("-" + comp if comp else "") for comp in [None] + comps]
+    filtered = not full and any(stanza.lower() in fields for stanza in stanzas)
     if not full:
+        for name in names:
+            m = re.match(r"files-(excluded|included)(?:-(.+))?$", name.lower())
+            if not m:
+                continue
+            if m.group(2) is not None and m.group(2) not in lower_comps:
+                die("debian/copyright's %s names no component in debian/gbp.conf" % name)
+            if m.group(1) == "included" and "files-excluded" + name.lower()[len("files-included"):] not in fields:
+                die("debian/copyright's %s needs Files-Excluded%s" % (name, name[len("Files-Included"):]))
+        for stanza in stanzas:
+            if filtered and stanza.lower() not in fields:
+                die("debian/copyright leaves files out, but has no %s field" % stanza)
         if upver != base and not filtered:
             die("%s is a +ds version, but debian/copyright has no Files-Excluded" % upver)
         if filtered and upver == base:
             die("debian/copyright leaves files out, so the version needs a +dsN suffix")
     os.makedirs(out, exist_ok=True)
-    comps = components(repo)
     origs = []
     for comp in [None] + comps:
         name = "%s_%s.orig%s.tar.xz" % (src, upver, "-" + comp if comp else "")
@@ -197,8 +215,7 @@ def make_orig(repo, out, full):
             cmd, env = archive(repo, ["--prefix=%s/" % prefix] + opts + [tree] + paths)
             with open(tar, "wb") as f:
                 run(cmd, cwd=repo, stdout=f, env=env)
-            stanza = "Files-Excluded-" + comp if comp else "Files-Excluded"
-            if filtered and stanza in fields:
+            if filtered:
                 res = subprocess.run(["mk-origtargz", "--package", src, "--version", upver, "--compression", "xz",
                                       "--copyright-file", os.path.join(head_debian(repo), "copyright"), "--repack",
                                       "--directory", tmp, "--copy"] + (["--component", comp] if comp else []) + [tar],
@@ -209,8 +226,6 @@ def make_orig(repo, out, full):
                     die("mk-origtargz failed or warned for %s" % name)
                 made = os.path.join(tmp, name)
             else:
-                if filtered and comp:
-                    die("debian/copyright leaves files out, but has no %s field" % stanza)
                 made = tar + ".xz"
                 with open(made, "wb") as f:
                     run(["xz", "-6", "-T1", "-c", tar], stdout=f)
